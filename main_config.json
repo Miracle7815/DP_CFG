@@ -3,9 +3,9 @@
         "base_url":"",
         "api_key":"",
         "model":"",
-        "code_base":"test_module",
-        "json_res_dir":"/home/miracle/DP_CFG/test_module/data/detailed_res_info",
-        "tmp_test_dir":"/home/miracle/DP_CFG/test_module/data/tmp_test",
+        "code_base":"/home/miracle/DP_CFG/generate_for_buggy",
+        "json_res_dir":"/home/miracle/DP_CFG/generate_for_buggy/data/detailed_res_info",
+        "tmp_test_dir":"/home/miracle/DP_CFG/generate_for_buggy/data/tmp_test",
         "expr_identifier":"",
         "path_mappings": {
             "Lang_1_buggy": {
