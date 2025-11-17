@@ -2,7 +2,7 @@ import os
 
 import chardet
 from ..data.config import CONFIG , logger
-from static_analysis import find_package_use_source_code
+from static_analysis import find_package_use_source_code , add_classes_and_methods_in_package
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
@@ -66,6 +66,12 @@ def get_packages(project_path , src_path):
 
         add_classes_and_methods_in_package(single_package , java_content , single_file)  # get classes and methods in file
 
+    all_packages = list(all_packages_map.values())
+
+    # 以 File 为单位进行分析
+    for single_file in all_files:
+        java_content = single_file.content
+        
         
 
 

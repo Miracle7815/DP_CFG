@@ -127,6 +127,61 @@ def find_method(node , new_class , package , single_file):
         find_method(child , new_class , package , single_file)
 
 
+def find_import(node , single_file , package_map , method_map):
+     #import com.example.classA;
+    if node.type == 'import_declaration':
+        # if package.name == 'org.jfree.chart.renderer.xy':
+        #     print(node.text.decode())
+        flag = False
+        import_node = None
+        # 判断是否存在import static java.util.* 形式
+        for child in node.children:
+            if child.type == 'asterisk':  # 代表有import *
+                flag = True
+            if child.type == 'scoped_identifier' or child.type == 'identifier':
+                import_node = child # com.exampke.classA
+        # print(flag)
+        if flag and import_node is not None:   # 如果 import * 就把这个包的所有class和method加入到single_file.import_map和method_map中
+            package_name = import_node.text.decode()  # eg: java.utils.*  package_name = java.utils
+            if package_name in package_map:
+                package = package_map[package_name]
+                # 把这个包的class都加进去
+                for classs in package.classes:
+                    single_file.import_map[classs.name_no_package] = classs.name  # File.import_map =  class_name_no_package : class_name_with_package
+                    for method in classs.methods:
+                        method_map[(method.name, tuple(method.parameters_list))] = method  # method_map = (method_name , (method_parameters)) : Method
+        elif import_node is not None:
+            class_name_node = import_node.child_by_field_name('name')
+            package_name = import_node.child_by_field_name('scope').text.decode()  # eg: com.example.classA  package_name = com.example | class_name = classA
+            class_name = class_name_node.text.decode() # classA 
+            # 把这个类里面的方法加到method_map里面
+            if package_name in package_map:
+                single_package = package_map[package_name]
+                for classs in single_package.classes:
+                    if classs.name == class_name:  
+                        for method in classs.methods:
+                            method_map[(method.name, tuple(method.parameters_list))] = method
+            single_file.import_map[class_name] = import_node.text.decode()  # 完整类名
+            # print(package.name)
+            # if package.name == 'org.jfree.chart.renderer.xy':
+            #     print(node.text.decode())
+            #     print(f'假{class_name} : {import_node.text.decode()}')
+    for child in node.children:
+        find_import(child, single_file, package_map, method_map)
+
+
+def get_package_import(single_file , source_code , all_packages):
+    tree = parser.parse(bytes(source_code , "utf8"))
+    root_node = tree.root_node
+    package_map = {}
+    
+    # package_name : Package
+    for single_package in all_packages:
+        package_map[single_package.name] = single_package
+    
+    method_map = {}
+    find_import(root_node , single_file , package_map , method_map)
+
 def add_classes_and_methods_in_package(package , source_code , single_file):
     """
     Adds classes and methods in a package based on the given source code.
