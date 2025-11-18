@@ -14,8 +14,8 @@ class Class():
         self.node = node
         self.father_class = None
         self.father_class_name = None
-        self.son_classed = set()
-        self.son_classed_name = set()
+        self.son_classes = set()
+        self.son_classes_name = set()
         self.variable_map = {}  # 全局变量
         self.import_map = {}
 

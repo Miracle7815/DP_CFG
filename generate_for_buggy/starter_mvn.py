@@ -18,7 +18,7 @@ def run_projcet(project_name, json_res_dir, tmp_test_dir):
     
     # 通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
     logger.debug(f"Begin static analysis project for {project_name}")
-    all_packages, method_map, class_map = analyze_project(project_name)
+    # all_packages, method_map, class_map = analyze_project(project_name)
     logger.debug(f"Finish static analysis project for {project_name}")
     
     # # 在项目中把已有的test都删掉，节省编译时间

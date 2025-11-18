@@ -1,20 +1,23 @@
 import os
 import sys
 
-import tree_sitter_java as ts_java
+# import tree_sitter_java as ts_java
+from tree_sitter_languages import get_language
 from ..basic_class.base_class import Class
 from ..basic_class.base_method import Method
 from tree_sitter import Language , Parser
 import queue
 
-JAVA_LANGUAGE = Language(ts_java.language(), name="java")
+# JAVA_LANGUAGE = Language(ts_java.language(), name="java")
+JAVA_LANGUAGE = get_language("java")
 parser = Parser()
-parser.language = JAVA_LANGUAGE
+# parser.language = JAVA_LANGUAGE
+parser.set_language(JAVA_LANGUAGE)
 
 def find_package(node):
     if node.type == "package_declaration":
         for child in node.children:
-            if child.type == "identifier":
+            if child.type == "scoped_identifier":
                 return child.text.decode("utf-8")   # package name
     
     for child in node.children:
@@ -37,7 +40,7 @@ def find_classes(node , package , out_class_name , class_queue , single_file):
     '''
         递归寻找类，不包含内部类
     '''
-    if node.type == "class_declaration":
+    if node.type in ['class_declaration', 'interface_declaration', 'enum_declaration']:
         class_name_node = node.child_by_field_name("name")
         class_name = class_name_node.text.decode()
         class_content = node.text.decode()
@@ -47,7 +50,7 @@ def find_classes(node , package , out_class_name , class_queue , single_file):
             class_name = f"{out_class_name}.{class_name}"
         
         # (name , belong_package , name_no_package , content , node)
-        new_class = Class(f"{package}.{class_name}" , package , class_name , class_content , node)
+        new_class = Class(f"{package.name}.{class_name}" , package , class_name , class_content , node)
         package.add_class(new_class)
         single_file.add_class(new_class)
 
@@ -61,6 +64,7 @@ def find_classes(node , package , out_class_name , class_queue , single_file):
 
 def get_type_to_full_name(node , method):
     import_map = method.import_map
+
     if node.type in ['integral_type', 'floating_point_type', 'void_type']:  # 整型 ， 浮点 ，void
         return node.text.decode()
     if node.type in ['scoped_type_identifier', 'type_identifier']:   # 简单类或作用域类 eg: List , java.util.List
@@ -70,6 +74,9 @@ def get_type_to_full_name(node , method):
         for child in node.children:
             if child.type == 'type_identifier':
                 type_identifier = child.text.decode()
+            elif child.type == "scoped_type_identifier":  # java.lang.Class<?>
+                type_identifier = child.text.decode()
+
         return import_map[type_identifier] if type_identifier in import_map else type_identifier
     if node.type == 'array_type':  # 数组类型 element + dimensions 递归处理，能够做到处理多维数组的能力 因为多维数组的element中依然是array_type
         return get_type_to_full_name(node.child_by_field_name('element'), method) + node.child_by_field_name('dimensions').text.decode()

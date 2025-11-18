@@ -2,12 +2,13 @@ import os
 from queue import Queue
 import chardet
 from ..data.config import CONFIG , logger
-from static_analysis import find_package_use_source_code , add_classes_and_methods_in_package , get_package_import , find_father_class
+from .static_analysis import find_package_use_source_code , add_classes_and_methods_in_package , get_package_import , find_father_class
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
 from ..basic_class.base_class import Class
 from ..basic_class.base_test_program import TestProgram
+from .cfg_generate import generate_cfg_for_method
 
 def find_java_files(directory):
     java_files = []
@@ -31,7 +32,7 @@ def get_packages(project_path , src_path):
     java_files = find_java_files(all_package_path)
     
     for java_path in java_files:
-    #     print(file_path)
+    #     print(java_path)
         try:
             with open(java_path, 'rb') as file:   # 二进制模式读文件
                 raw_data = file.read()
@@ -45,9 +46,9 @@ def get_packages(project_path , src_path):
         except Exception as e:
             print(f"An error occurred: {e}")
             continue
-
         
         package_name = find_package_use_source_code(java_content)
+        # print(package_name)
 
         if package_name is None:
             continue
@@ -84,13 +85,14 @@ def get_packages(project_path , src_path):
     # 根据import更新参数列表和return type
     for single_file in all_files:
         for classs in single_file.classes:
+            # print(classs.name + ": ")
             classs.belong_file = single_file
             for method in classs.methods:
                 method.belong_file = single_file
-
+                # print(method.name)
                 if method.return_type in method.import_map:
                     method.return_type = method.import_map[method.return_type]
-                if method.return_type in class_map.import_map:
+                if method.return_type in class_map:
                     method.return_type = class_map[method.return_type]
 
                 new_parameters_list = []
@@ -99,6 +101,7 @@ def get_packages(project_path , src_path):
                         parameter = method.import_map[parameter]
                     new_parameters_list.append(parameter)
                 method.parameters_list = new_parameters_list
+                # print(method.name , method.return_type , method.parameters_list)
                 method.set_method_signature()     # signature = belong_package.name#belong_class.name_no_package#method.name_no_package({parameters_string})
         
     for single_file in all_files:
@@ -159,19 +162,32 @@ def get_packages(project_path , src_path):
             method_map[(name, arguments_list)]= method
 
     all_packages = list(all_packages_map.values()) 
+
+
+    print(len(all_files))
+    for single_file in all_files:
+        if single_file.file_name == "NumberUtils.java":
+            print(single_file.file_name + ":")
+            for classs in single_file.classes:
+                print(classs.name_no_package , classs.father_class_name)
+                for method in classs.methods:
+                    generate_cfg_for_method(project_path , method)
+                    print("    " + method.signature , method.return_type , method.line_range , method.import_map)
+        
+
     return all_packages, method_map, class_map
 
 
-def analyze_project(project_name):
-    """
-        通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
-    """
-    # eg: loc = "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy"  src = "src/main/java"
-    all_packages, method_map, class_map = get_packages(CONFIG['path_mappings'][project_name]['loc'], CONFIG['path_mappings'][project_name]['src'])
-    setup_all_packages(project_name, all_packages, method_map, class_map)
-    return all_packages, method_map, class_map
+# def analyze_project(project_name):
+#     """
+#         通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
+#     """
+#     # eg: loc = "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy"  src = "src/main/java"
+#     all_packages, method_map, class_map = get_packages(CONFIG['path_mappings'][project_name]['loc'], CONFIG['path_mappings'][project_name]['src'])
+#     setup_all_packages(project_name, all_packages, method_map, class_map)
+#     return all_packages, method_map, class_map
 
-if __name__ == "__main__":
-    project_path = "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy"
-    src_path = "src/main/java"
-    get_packages(project_path , src_path)
+# if __name__ == "__main__":
+#     project_path = "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy"
+#     src_path = "src/main/java"
+#     get_packages(project_path , src_path)
