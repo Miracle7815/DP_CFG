@@ -28,18 +28,18 @@ def find_package(node):
     
     return None
 
-def find_package_use_source_code(source_code):
+def find_package_name_use_source_code(source_code):
     '''
-        根据源代码解析出的语法树找到包声明
+        find package declaration based on source code syntax tree
     '''
-    tree = parser.parse(bytes(source_code , "utf8"))  # 解析为字节流
-    root_node = tree.root_node   # root node 保存了代码的语法结构
+    tree = parser.parse(bytes(source_code , "utf8")) 
+    root_node = tree.root_node   # root node
     package_name = find_package(root_node)
     return package_name
 
 def find_classes(node , package , out_class_name , class_queue , single_file):
     '''
-        递归寻找类，不包含内部类
+        find classes except inner classes
     '''
     if node.type in ['class_declaration', 'interface_declaration', 'enum_declaration']:
         class_name_node = node.child_by_field_name("name")
@@ -47,7 +47,7 @@ def find_classes(node , package , out_class_name , class_queue , single_file):
         class_content = node.text.decode()
 
         if out_class_name != None:
-            # 处理内部类
+            # inner class 
             class_name = f"{out_class_name}.{class_name}"
         
         # (name , belong_package , name_no_package , content , node)
@@ -84,15 +84,18 @@ def get_type_to_full_name(node , method):
     return node.text.decode()
 
 def find_method(node , new_class , package , single_file):
+    # inner method will be parsed when new_class is inner class
     if node.type in ["class_declaration" , "interface_declaration" , "enum_declaration"]:
         return 
     if node.type in ['constructor_declaration' , 'method_declaration']:
-        method_modifier = None
+        method_modifiers = []
         is_target = False
         for child in node.children:
-            if child.type == 'method_modifier':
-                method_modifier = child.text.decode()
-        if method_modifier == "public":
+            if child.type == 'modifiers':
+                for mod_child in child.children:
+                    method_modifiers.append(mod_child.text.decode())
+        
+        if "public" in method_modifiers:
             is_target = True
         
         method_content = node.text.decode()
@@ -100,14 +103,14 @@ def find_method(node , new_class , package , single_file):
         # return type
         if node.type == "method_declaration":
             method_return_type = get_type_to_full_name(node.child_by_field_name('type'), new_class)
-        else:  #构造函数返回的是本身自己的类
+        else:  # constructor return its class
             method_return_type = new_class.name
 
         # parameters
         parameters = []
         name_node = node.child_by_field_name('name')
         parameters_node = node.child_by_field_name('parameters')
-        if name_node is None or parameters is None:
+        if name_node is None or parameters_node is None:
             return 
         
         method_name = name_node.text.decode()
@@ -707,7 +710,7 @@ def find_call_method(package , method_map , class_map):
             # print(f'{method.name} method_list {method_list}')
 
 
-def add_classes_and_methods_in_package(package , source_code , single_file):
+def add_file_classes_and_methods_to_package(package , single_file):
     """
     Adds classes and methods in a package based on the given source code.
 
@@ -720,12 +723,13 @@ def add_classes_and_methods_in_package(package , source_code , single_file):
         None
     """
     # Rest of the code...
+    source_code = single_file.content
     tree = parser.parse(bytes(source_code, "utf8"))
     root_node = tree.root_node
     class_queue = queue.Queue()
-    find_classes(root_node, package, None, class_queue, single_file)  # 不包括内部类
+    find_classes(root_node, package, None, class_queue, single_file)  # exclude inner class
     while not class_queue.empty():
         now_class, now_node = class_queue.get()
-        out_class_name = now_class.name_no_package  # 寻找内部类
+        out_class_name = now_class.name_no_package  # find inner class
         find_classes(now_node, package, out_class_name, class_queue, single_file)
         find_method(now_node, now_class, package, single_file)

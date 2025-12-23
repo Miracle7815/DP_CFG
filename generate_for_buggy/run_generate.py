@@ -2,13 +2,13 @@ import time
 import os
 import json
 import traceback
-from .data.config import CONFIG , logger , code_base
+from config import CONFIG , logger , code_base
 
 time_dict = {}
 
-def run_projcet(project_name, json_res_dir, tmp_test_dir):
+def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     json_res_file = os.path.join(json_res_dir, project_name + '.jsonl')
-    json_writer = open(json_res_file, "w",)
+    json_writer = open(json_res_file, "w" , encoding='utf-8')
     
     time_dict[project_name] = {}  # 记录时间
     

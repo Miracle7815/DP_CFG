@@ -1,8 +1,8 @@
 import os
 from queue import Queue
 import chardet
-from ..data.config import CONFIG , logger
-from .static_analysis import find_package_use_source_code , add_classes_and_methods_in_package , get_package_import , find_father_class , find_call_method
+from ..config import CONFIG , logger
+from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class , find_call_method
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
@@ -13,7 +13,7 @@ from .cfg_generate import generate_cfg_for_file
 def find_java_files(directory):
     java_files = []
 
-    for root , dirs , files in os.walk(directory):
+    for root , _ , files in os.walk(directory):
         for file in files:
             if file.endswith('.java'):
                 file_path = os.path.join(root , file)
@@ -47,7 +47,7 @@ def get_packages(project_path , src_path):
             print(f"An error occurred: {e}")
             continue
         
-        package_name = find_package_use_source_code(java_content)
+        package_name = find_package_name_use_source_code(java_content)
         # print(package_name)
 
         if package_name is None:
@@ -65,7 +65,7 @@ def get_packages(project_path , src_path):
         single_package.add_file(single_file)
         all_files.append(single_file)
 
-        add_classes_and_methods_in_package(single_package , java_content , single_file)  # get classes and methods in file
+        add_file_classes_and_methods_to_package(single_package , single_file)  # get classes and methods in file
 
     all_packages = list(all_packages_map.values())
 

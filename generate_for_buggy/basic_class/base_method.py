@@ -55,8 +55,6 @@ class Method():
         self.covered_tests = set()
 
         # cfg
-        self.cfg = set()
-
 
     def get_package_name(self):
         return self.belong_package.name

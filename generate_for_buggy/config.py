@@ -4,7 +4,7 @@ import sys
 import json
 import logging
 
-_config_file = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')), 'main_config.json')
+_config_file = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), 'main_config.json')
 
 with open(_config_file, 'r', encoding='utf-8') as f:
     CONFIG = json.loads(f.read())['generate_for_buggy']
@@ -13,7 +13,7 @@ code_base = CONFIG['code_base']
 
 def init_logger(project_name="myproject"):
     '''
-        创建logger
+        create logger
     '''
     logger = logging.getLogger(project_name)
     logger.setLevel(logging.DEBUG)       # 设置记录器的最低日志等级为 DEBUG。意味着所有等级（DEBUG、INFO、WARNING、ERROR、CRITICAL）都能捕获

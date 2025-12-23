@@ -4,17 +4,17 @@
         "api_key":"",
         "model":"",
         "code_base":"/home/miracle/DP_CFG/generate_for_buggy",
-        "json_res_dir":"/home/miracle/DP_CFG/generate_for_buggy/data/detailed_res_info",
-        "tmp_test_dir":"/home/miracle/DP_CFG/generate_for_buggy/data/tmp_test",
+        "json_res_dir":"/home/miracle/DP_CFG/data/generate_for_buggy/data/detailed_res_info",
+        "tmp_test_dir":"/home/miracle/DP_CFG/data/generate_for_buggy/data/tmp_test",
         "expr_identifier":"",
         "path_mappings": {
             "Lang_1_buggy": {
-                "loc": "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy",
+                "loc": "/home/miracle/DP_CFG/data/project_under_test/Lang/Lang_1_buggy",
                 "src": "src/main/java",
                 "test": "src/test/java",
                 "test_scale": "method",
-                "focal_method": "/home/miracle/DP_CFG/test_module/data/Lang_1_buggy_focal_method.jsonl",
-                "focal_class": "/home/miracle/DP_CFG/test_module/data/Lang_1_buggy_focal_class.jsonl"
+                "focal_method": "/home/miracle/DP_CFG/data/test_info/Lang/Lang_1_buggy_focal_method.jsonl",
+                "focal_class": "/home/miracle/DP_CFG/data/test_info/Lang/Lang_1_buggy_focal_class.jsonl"
             }
         }
     }

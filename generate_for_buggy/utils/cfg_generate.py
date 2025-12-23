@@ -1,4 +1,4 @@
-from ..data.config import CONFIG
+from ..config import CONFIG
 import os
 import subprocess
 from comex.codeviews.combined_graph.combined_driver import CombinedDriver
