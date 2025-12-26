@@ -8,6 +8,13 @@ class File():
         self.import_map = {}
         self.belong_package = belong_package
 
+        self.import_method_map = {}
+        self.import_static_method = {}
+        self.import_static_field = {}
+
+        self.import_jdk_map = {}
+        self.import_static_jdk_map = {}
+
     def add_method(self , method):
         self.methods.add(method)
     

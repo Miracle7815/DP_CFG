@@ -19,6 +19,7 @@ class Class():
         self.variable_map = {}  # 全局变量
         self.import_map = {}
 
+        self.fields = {}
     
     def add_constructor(self , constructor):
         self.constructor.add(constructor)

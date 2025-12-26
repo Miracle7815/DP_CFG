@@ -2,7 +2,7 @@ from collections import defaultdict
 import copy
 
 class Method():
-    def __init__(self , name_no_package , name , belong_package , belong_class , parameters_list , content , return_type , node):
+    def __init__(self , name_no_package , name , belong_package , belong_class , parameters_list , parameters_modifiers_list , content , return_type , node):
         self.name_no_package = name_no_package
         self.name = name
 
@@ -11,6 +11,7 @@ class Method():
         self.belong_file = None
 
         self.parameters_list = parameters_list
+        self.parameters_modifiers_list = parameters_modifiers_list
         self.signature = ''
 
         self.content = content
@@ -41,6 +42,7 @@ class Method():
         self.using_callee_chains = list()
 
         self.is_target = False
+        self.is_static = False
 
         self.direct_programs = list()
 
@@ -142,6 +144,7 @@ class Method():
             else:
                 package_name = parameter.split('.' + class_name)[0]
                 help_parameters_list.append(package_name + '#' + class_name)
-        parameters_string = ','.join(item for item in help_parameters_list)
+        # parameters_string = ','.join(item for item in help_parameters_list)
+        parameters_string = ','.join((modifier.strip() + " " if modifier != "no modifier" else "") + item for modifier , item in zip(self.parameters_modifiers_list , help_parameters_list))
         
         self.signature = f'{self.belong_package.name}#{self.belong_class.name_no_package}#{self.name_no_package}({parameters_string})'
