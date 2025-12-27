@@ -325,6 +325,7 @@ def find_father_class(node , classs):
                                     classs.father_interfaces[interface_name] = f'{classs.belong_package.name}.{interface_name}'
 
             if child.type == 'super_interfaces':    # implements interface
+                superclass_node = child
                 if superclass_node is None:
                     continue
 
