@@ -279,7 +279,6 @@ def get_package_import(single_file , source_code , all_packages):
 
 def find_father_class(node , classs):
     if node.type in ['class_declaration', 'interface_declaration', 'enum_declaration']:
-        #   #   #   #
         name_node = node.child_by_field_name("name")
         name = name_node.text.decode()
         if name is None or name != classs.name_no_package:
@@ -291,47 +290,64 @@ def find_father_class(node , classs):
             for child in superclass_node.children:
                 if child.type == 'type_identifier':
                     superclass_name = child.text.decode()
-            # print('yes')
+            
             if superclass_name == "":
-                return
+                pass
             if superclass_name in classs.import_map:
                 classs.add_father_class_name(classs.import_map[superclass_name])
-            else:  # 默认父类在一个包里面
+            else:  # assume it is in the same package
                 classs.add_father_class_name(f'{classs.belong_package.name}.{superclass_name}')
-            return
-        superclass_node = None
+        
+
         for child in node.children:   
+            superclass_node = None
             if child.type == 'extends_interfaces':   # extends interface
                 superclass_node = child
-                break
+                if superclass_node is None:
+                    continue
+
+                for super_child in superclass_node.children:
+                    type_node = None
+                    if super_child.type == 'type_list':
+                        type_node = super_child
+                        if type_node is None:
+                            continue
+
+                        for type_child in type_node.children:
+                            interface_name = None
+                            if type_child.type == 'type_identifier':
+                                interface_name = type_child.text.decode()
+                                if interface_name is None:
+                                    continue
+                                if interface_name in classs.import_map:
+                                    classs.father_interfaces[interface_name] = classs.import_map[interface_name]
+                                else:
+                                    classs.father_interfaces[interface_name] = f'{classs.belong_package.name}.{interface_name}'
+
             if child.type == 'super_interfaces':    # implements interface
-                superclass_node = child
-                break
-        if superclass_node is None:
-            return
-        
-        type_node = None
-        for child in superclass_node.children:   # 获取接口列表
-            if child.type == 'type_list':
-                type_node = child
-                break
-        if type_node is None:
-            return
-        
-        superclass_name = None
-        for child in type_node.children:
-            if child.type == 'type_identifier':
-                superclass_name = child.text.decode()
-        if superclass_name is None:
-            return
-        if superclass_name in classs.import_map:
-            classs.add_father_class_name(classs.import_map[superclass_name])
-        else:
-            classs.add_father_class_name(f'{classs.belong_package.name}.{superclass_name}')
-        return
+                if superclass_node is None:
+                    continue
+
+                for super_child in superclass_node.children:
+                    type_node = None
+                    if super_child.type == 'type_list':
+                        type_node = super_child
+                        if type_node is None:
+                            continue
+
+                        for type_child in type_node.children:
+                            interface_name = None
+                            if type_child.type == 'type_identifier':
+                                interface_name = type_child.text.decode()
+                                if interface_name is None:
+                                    continue
+                                if interface_name in classs.import_map:
+                                    classs.implemented_interfaces[interface_name] = classs.import_map[interface_name]
+                                else:
+                                    classs.implemented_interfaces[interface_name] = f'{classs.belong_package.name}.{interface_name}'
     
-    for child in node.children:
-        find_father_class(child, classs)   # ？？？ 内部类的父类难道不会更新为该类的父类吗
+    # for child in node.children:
+    #     find_father_class(child, classs)   # ？？？ 内部类的父类难道不会更新为该类的父类吗
 
 def find_class_field(node , classs , single_file):
     if node.type in ['field_declaration', 'constant_declaration']:

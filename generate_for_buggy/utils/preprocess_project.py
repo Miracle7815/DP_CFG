@@ -2,7 +2,7 @@ import os
 from queue import Queue
 import chardet
 from ..config import CONFIG , logger
-from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import # , find_father_class , find_call_method
+from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class #, find_call_method
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
@@ -104,9 +104,9 @@ def get_packages(project_path , src_path):
                 # print(method.name , method.return_type , method.parameters_list)
                 method.set_method_signature()     # signature = belong_package.name#belong_class.name_no_package#method.name_no_package({parameters_string})
         
-    # for single_file in all_files:
-    #     for classs in single_file.classes:
-    #         find_father_class(classs.node , classs)
+    for single_file in all_files:
+        for classs in single_file.classes:
+            find_father_class(classs.node , classs)
 
     # for single_file in all_files:
     #     for classs in single_file.classes:

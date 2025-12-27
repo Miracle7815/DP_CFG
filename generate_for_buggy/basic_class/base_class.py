@@ -12,10 +12,16 @@ class Class():
         self.constructor = set()
         self.content = content
         self.node = node
+
         self.father_class = None
         self.father_class_name = None
+
+        self.implemented_interfaces = {}
+        self.father_interfaces = {}
+
         self.son_classes = set()
         self.son_classes_name = set()
+
         self.variable_map = {}  # 全局变量
         self.import_map = {}
 

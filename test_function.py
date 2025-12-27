@@ -13,7 +13,7 @@ import static java.lang.Math.*;
 import static java.lang.Math.PI;
 
 @Data
-public class LLMGeneratedTests {
+public class LLMGeneratedTests extends FatherClass implements FatherInterface{
 /** Reusable Long constant for zero. */
     public static final Long LONG_ZERO = Long.valueOf(0L);
     /** Reusable Long constant for one. */
@@ -42,7 +42,7 @@ import static java.lang.Math.*;
 import static java.lang.Math.PI;
 
 @Data
-public interface LLMGeneratedTests {
+public interface LLMGeneratedTests extends FatherInterface_1 , FatherInterface_2{
 /** Reusable Long constant for zero. */
     public static final Long LONG_ZERO = Long.valueOf(0L);
     /** Reusable Long constant for one. */
@@ -56,7 +56,7 @@ public interface LLMGeneratedTests {
     s1 = getName(a , b);
     boolean flag = True;
 
-    public static ResResult<UserVO> register(UserVO userVO , final @Nonull int x , String str){
+    public static ResResult<UserVO> register(UserVO userVO , final @Nonull int x , String str) {
         a(true);
         return true;
     }
@@ -147,6 +147,22 @@ for child in root_node.children:
                 print("name: " , child_node.child_by_field_name('name').text.decode())
 
 
+# for child in class_node.children:
+#     node = child.child_by_field_name('superclass')
+#     print(node.text.decode() if node else None)
+
+super_class_node = class_node.child_by_field_name('superclass')
+for child in super_class_node.children:
+    print(child.type , child.text.decode())
+
+
+for child in class_node.children:
+    if child.type == 'super_interfaces':    # implements interface
+        superclass_node = child
+        for child_child in superclass_node.children:
+            print(child_child.type , child_child.text.decode())
+
+
 print("-----------------------")
 
 tree_2 = parser.parse(bytes(source_code_2, "utf8"))
@@ -161,3 +177,6 @@ for child in root_node_2.children:
 for child in class_node.child_by_field_name('body').children:
     if child.type in ['field_declaration' , 'constant_declaration']:
         print(child.type , child.text.decode())
+
+for child in class_node.children:
+    print(child.type , child.text.decode())
