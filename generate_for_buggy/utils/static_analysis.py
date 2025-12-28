@@ -51,6 +51,10 @@ def find_classes(node , package , out_class_name , class_queue , single_file):
         
         # (name , belong_package , name_no_package , content , node)
         new_class = Class(f"{package.name}.{class_name}" , package , class_name , class_content , node)
+        if node.type == 'enum_declaration':
+            new_class.is_enum = True
+        if node.type == 'interface_declaration':
+            new_class.is_interface = True
         package.add_class(new_class)
         single_file.add_class(new_class)
 
@@ -343,9 +347,9 @@ def find_father_class(node , classs):
                                 if interface_name is None:
                                     continue
                                 if interface_name in classs.import_map:
-                                    classs.implemented_interfaces[interface_name] = classs.import_map[interface_name]
+                                    classs.implement_interfaces[interface_name] = classs.import_map[interface_name]
                                 else:
-                                    classs.implemented_interfaces[interface_name] = f'{classs.belong_package.name}.{interface_name}'
+                                    classs.implement_interfaces[interface_name] = f'{classs.belong_package.name}.{interface_name}'
     
     # for child in node.children:
     #     find_father_class(child, classs)   # ？？？ 内部类的父类难道不会更新为该类的父类吗

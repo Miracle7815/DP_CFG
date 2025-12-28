@@ -4,6 +4,9 @@ class Class():
     def __init__(self , name , belong_package , name_no_package , content , node):
         self.name = name # full name
         self.name_no_package = name_no_package # name without package
+
+        self.is_enum = False
+        self.is_interface = False
         
         self.belong_package = belong_package
         self.belong_file = None
@@ -16,7 +19,7 @@ class Class():
         self.father_class = None
         self.father_class_name = None
 
-        self.implemented_interfaces = {}
+        self.implement_interfaces = {}
         self.father_interfaces = {}
 
         self.son_classes = set()
