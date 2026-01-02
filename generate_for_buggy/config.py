@@ -11,8 +11,6 @@ with open(_config_file, 'r', encoding='utf-8') as f:
 
 code_base = CONFIG['code_base']
 
-focal
-
 def init_logger(project_name="myproject"):
     '''
         create logger

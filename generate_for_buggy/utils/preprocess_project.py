@@ -2,13 +2,13 @@ import os
 from queue import Queue
 import chardet
 from ..config import CONFIG , logger
-from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class #, find_call_method
+from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class , find_call_method
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
 from ..basic_class.base_class import Class
 from ..basic_class.base_test_program import TestProgram
-from .cfg_generate import generate_cfg_for_file
+# from .cfg_generate import generate_cfg_for_file
 
 def find_java_files(directory):
     java_files = []
@@ -93,7 +93,7 @@ def get_packages(project_path , src_path):
                 if method.return_type in method.import_map:
                     method.return_type = method.import_map[method.return_type]
                 if method.return_type in class_map:
-                    method.return_type = class_map[method.return_type]
+                    method.return_type = class_map[method.return_type].name
 
                 new_parameters_list = []
                 for parameter in method.parameters_list:
@@ -103,7 +103,8 @@ def get_packages(project_path , src_path):
                 method.parameters_list = new_parameters_list
                 # print(method.name , method.return_type , method.parameters_list)
                 method.set_method_signature()     # signature = belong_package.name#belong_class.name_no_package#method.name_no_package({parameters_string})
-        
+    
+    # father class
     for single_file in all_files:
         for classs in single_file.classes:
             find_father_class(classs.node , classs)
@@ -157,76 +158,41 @@ def get_packages(project_path , src_path):
     
     all_packages = list(all_packages_map.values())
 
-    # # 处理每一个method的行范围
-    # for single_package in all_packages:
-    #     for method in single_package.methods:
-    #         method_node = method.node
-    #         # 源代码的行号
-    #         for i in range(method_node.start_point[0], method_node.end_point[0] + 1):
-    #             method.line_range.add(i + 1)
-    #             method.line_number.add(str(i + 1))
-    #         name = method.name
-    #         arguments_list = tuple(method.parameters_list)
-    #         method_map[(name, arguments_list)]= method
+    # method line range
+    for single_package in all_packages:
+        for method in single_package.methods:
+            method_node = method.node
+            
+            for i in range(method_node.start_point[0], method_node.end_point[0] + 1):
+                method.line_range.add(i + 1)
+                method.line_number.add(str(i + 1))
+            name = method.name
+            arguments_list = tuple(method.parameters_list)
+            method_map[(name, arguments_list)]= method
 
-    # all_packages = list(all_packages_map.values()) 
+    all_packages = list(all_packages_map.values()) 
 
-    # for single_package in all_packages:
-    #     find_call_method(single_package , method_map , class_map)
-    #     package_name = single_package.name
+    # cfg dfg
+    # for sigle_file in all_files:
 
-    # print(len(all_files))
-    # for single_file in all_files:
-    #     if single_file.file_name == "NumberUtils.java":
-    #         print(single_file.file_name + ":")
-    #         generate_cfg_for_file(project_path , single_file)
-    #         for classs in single_file.classes:
-    #             print(classs.name_no_package , classs.father_class_name)
-    #             for method in classs.methods:
-    #                 print("    " + method.signature , method.return_type , method.line_range , method.import_map)
+    for single_package in all_packages:
+        find_call_method(single_package , method_map , class_map)
+        package_name = single_package.name
+
+    print(len(all_files))
+    for single_file in all_files:
+        if single_file.file_name == "NumberUtils.java":
+            print(single_file.file_name + ":")
+            # generate_cfg_for_file(project_path , single_file)
+            # for classs in single_file.classes:
+            #     print(classs.name_no_package , classs.father_class_name)
+            #     for method in classs.methods:
+            #         print("    " + method.signature , method.return_type , method.line_range , method.import_map)
     
     all_packages = list(all_packages_map.values()) 
 
     return all_packages, method_map, class_map
 
-# 调用链
-def find_all_chains(start_node, visited=None, path=None, depth=0, max_depth=10):
-    if visited is None:
-        visited = set()
-    if path is None:
-        path = [start_node]
-
-    # Stop the recursion if the max depth is reached
-    if depth > max_depth:
-        return []
-    
-    # path = path + [start_node]
-    visited.add(start_node)
-    start_node.set_target()
-    
-    all_paths = []
-
-    for next_node in start_node.called_methods:
-        # print(f"{start_node.name} -> {next_node.name}")
-        if next_node not in visited:
-            new_paths = find_all_chains(next_node, visited | {next_node}, path + [next_node], depth + 1, max_depth)
-            # tmp_path = path + [start_node]
-            tmp_path = path + [next_node]
-            next_node.add_callee_chain(tmp_path)  # 被调用方法被调用的链
-            all_paths.extend(new_paths)
-        else: # 出现环
-            # Detect cycle - stop the path here to avoid infinite loop
-            cycle_index = path.index(next_node)
-            # tmp_path = path + [start_node]
-            tmp_path = path[:cycle_index] + [next_node]
-            next_node.add_callee_chain(tmp_path)
-            all_paths.append(path)
-    
-    # 如果 start_node.called_methods 是空的，添加当前路径
-    if not start_node.called_methods:
-        all_paths.append(path)
-        
-    return all_paths
 
 
 def setup_single_package(all_methods_in_package , method_map , class_map):
@@ -268,12 +234,12 @@ def setup_single_package(all_methods_in_package , method_map , class_map):
                 branch_related_called_class = class_map.get(branch_related_called_class_name)
                 single_method.add_branch_related_called_methods_and_class(branch_related_called_method, branch_related_called_class)
 
-    for single_method in all_methods_in_package:
-        paths_from_single_func = find_all_chains(single_method)
-        for i in paths_from_single_func:
-            if len(i[1:]) != 0:
-                single_method.add_called_chain(i[1:])    # 不包括自己的后续链加入
-    pass
+    # for single_method in all_methods_in_package:
+    #     paths_from_single_func = find_all_chains(single_method)
+    #     for i in paths_from_single_func:
+    #         if len(i[1:]) != 0:
+    #             single_method.add_called_chain(i[1:])    # 不包括自己的后续链加入
+    # pass
 
 def setup_all_packages(project_name , all_packages , method_map , class_map):
     all_methods_in_package = set()
@@ -289,8 +255,12 @@ def analyze_project(project_name):
     """
         通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
     """
+    project_group = project_name.split('_')[0]   # eg: Lang
+    project_path = os.path.join(CONFIG['mappings']['buggy_loc'] , project_group , project_name)
+    src_path = CONFIG['mappings']['src']   # src/main/java
+
     # eg: loc = "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy"  src = "src/main/java"
-    all_packages, method_map, class_map = get_packages(CONFIG['path_mappings'][project_name]['loc'], CONFIG['path_mappings'][project_name]['src'])
+    all_packages, method_map, class_map = get_packages(project_path , src_path)
     setup_all_packages(project_name, all_packages, method_map, class_map)
     return all_packages, method_map, class_map
 

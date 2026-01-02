@@ -2,7 +2,8 @@ import time
 import os
 import json
 import traceback
-from config import CONFIG , logger , code_base
+from config import CONFIG , logger , code_baseModuleNotFoundError
+from utils.preprocess_project import analyze_project
 
 time_dict = {}
 
@@ -18,7 +19,7 @@ def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     
     # 通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
     logger.debug(f"Begin static analysis project for {project_name}")
-    # all_packages, method_map, class_map = analyze_project(project_name)
+    all_packages, method_map, class_map = analyze_project(project_name + "_buggy")
     logger.debug(f"Finish static analysis project for {project_name}")
     
     # # 在项目中把已有的test都删掉，节省编译时间
@@ -64,9 +65,21 @@ def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     #     pass
 
 def run(json_res_dir , tmp_test_dir):
-    todo_projects = [project for project in list(CONFIG['path_mappings'].keys())]
+    # todo_projects = [project for project in list(CONFIG['path_mappings'].keys())]
+
+    todo_list = []
+    data_list_path = os.path.join(os.path.dirname(__file__) , '..' , 'data' , 'defects4j_list.txt')
+
+    with open(data_list_path , 'r' , encoding='utf-8') as f:
+        contents = f.readlines()
+        for line in contents:
+            project_name = line.strip()
+
+            if project_name == "Lang_1":
+                todo_list.append(project_name)
+            # todo_list.append(project_name)
     
-    for project_index , project_name in enumerate(todo_projects):
+    for project_index , project_name in enumerate(todo_list):
         logger.debug(f"Begin processing project {project_name}")
         
         run_projcet(project_name, json_res_dir, tmp_test_dir)
@@ -106,13 +119,11 @@ def record_time(time_dict, date):
         json.dump(time_dict, f)
 
 def generate_entry():
-    # 获取当前时间的时间戳
     timestamp = time.time()
-    # 将时间戳转换为可读的时间字符串（例如：2023-04-01 12:34:56）
     readable_time = time.strftime('%Y-%m-%d_%H:%M:%S', time.localtime(timestamp))
     
     # 用于标记区分每一次运行
-    date = CONFIG['expr_identifier']
+    # date = CONFIG['expr_identifier']
     # date = 'test_926'
     # 本项目路径
     code_base = CONFIG['code_base'] # code_base = "/data/WiseUT/coverage_module"
@@ -121,17 +132,19 @@ def generate_entry():
     # done_proj_file = os.path.join(code_base, CONFIG['done_project'])
     
     # 存储所有的大模型生成后的结果
-    json_res_dir = os.path.join(code_base, CONFIG['json_res_dir'], date)   # json_res_dir = "/data/WiseUT/coverage_module/data/detailed_res_info"
+    # json_res_dir = os.path.join(code_base, CONFIG['json_res_dir'], date)   # json_res_dir = "/data/WiseUT/coverage_module/data/detailed_res_info"
+    json_res_dir = CONFIG['json_res_dir']
     os.makedirs(json_res_dir, exist_ok=True)
     
     # 存储所有现有的test case的路径
-    tmp_test_dir = os.path.join(code_base, CONFIG['tmp_test_dir'], date)   # tmp_test_dir = "/data/WiseUT/coverage_module/data/tmp_test"
+    # tmp_test_dir = os.path.join(code_base, CONFIG['tmp_test_dir'], date)   # tmp_test_dir = "/data/WiseUT/coverage_module/data/tmp_test"
+    tmp_test_dir = CONFIG['tmp_test_dir']
     os.makedirs(tmp_test_dir, exist_ok=True)
     
     logger.debug("Generation begins!")    # logger.debug是让logger输出一条debug等级的日志消息
     run(json_res_dir, tmp_test_dir, debugging_mode=False)
     logger.debug("Generation completed!")
     
-    record_time(time_dict, date)
+    # record_time(time_dict, date)
 
     

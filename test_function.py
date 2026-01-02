@@ -26,6 +26,8 @@ public class LLMGeneratedTests extends FatherClass implements FatherInterface{
     String s = new String("Hello");
     s1 = getName(a , b);
     boolean flag = True;
+    int[][] array1 = new int[5][5];
+    List<String> list = new ArrayList<>();
 
     public static ResResult<UserVO> register(UserVO userVO , final @Nonull int x , String str){
         a(true);
@@ -161,6 +163,25 @@ for child in class_node.children:
         superclass_node = child
         for child_child in superclass_node.children:
             print(child_child.type , child_child.text.decode())
+
+for child in class_node.child_by_field_name('body').children:
+    if child.type in ['field_declaration' , 'constant_declaration']:
+        type_node = child.child_by_field_name('type')
+        print(type_node.type , end=': ')
+        for var_child in child.children:
+            print(var_child.type , var_child.text.decode() , end="  ")
+            if var_child.type == 'variable_declarator':
+                var_name_node = var_child.child_by_field_name('name')
+                print("name: " , var_name_node.text.decode() , end="  ")
+                var_value_node = var_child.child_by_field_name('value')
+                if var_value_node:
+                    print("value: " , var_value_node.type , var_value_node.text.decode() , end="  ")
+                    if var_value_node.type == 'object_creation_expression':
+                        obj_type_node = var_value_node.child_by_field_name('type')
+                        print("object type: " , obj_type_node.text.decode() , end="  ")
+                        for child_child in var_value_node.children:
+                            print("yes ", child_child.type , child_child.text.decode() , end="  ")
+        print()
 
 
 print("-----------------------")
