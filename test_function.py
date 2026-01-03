@@ -29,6 +29,23 @@ public class LLMGeneratedTests extends FatherClass implements FatherInterface{
     int[][] array1 = new int[5][5];
     List<String> list = new ArrayList<>();
 
+    /**
+     * <p>Convert a <code>String</code> to an <code>int</code>, returning
+     * <code>zero</code> if the conversion fails.</p>
+     *
+     * <p>If the string is <code>null</code>, <code>zero</code> is returned.</p>
+     *
+     * <pre>
+     *   NumberUtils.toInt(null) = 0
+     *   NumberUtils.toInt("")   = 0
+     *   NumberUtils.toInt("1")  = 1
+     * </pre>
+     *
+     * @param str  the string to convert, may be null
+     * @return the int represented by the string, or <code>zero</code> if
+     *  conversion fails
+     * @since 2.1
+     */
     public static ResResult<UserVO> register(UserVO userVO , final @Nonull int x , String str){
         a(true);
         return true;
@@ -68,11 +85,21 @@ public interface LLMGeneratedTests extends FatherInterface_1 , FatherInterface_2
 tree = parser.parse(bytes(source_code, "utf8"))
 root_node = tree.root_node
 
+# for child in root_node.children:
+#     print(child.type , child.text.decode())
+
+# print("-----------------------")
+
 class_node = None
 for child in root_node.children:
     if child.type == 'class_declaration':
         class_node = child
         break
+
+# for child in class_node.children:
+#     print(child.type , child.text.decode())
+
+# print("-----------------------")
 
 class_name = class_node.child_by_field_name('name').text.decode()
 class_content = class_node.text.decode()
@@ -83,6 +110,10 @@ for child in class_node.child_by_field_name('body').children:
         method_node = child
         break
 
+for child in class_node.child_by_field_name('body').children:
+    print(child.type , child.text.decode())
+
+print("-----------------------")
 
 method_modifiers = []
 is_target = False

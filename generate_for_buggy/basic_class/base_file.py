@@ -15,6 +15,11 @@ class File():
         self.import_jdk_map = {}
         self.import_static_jdk_map = {}
 
+        # cfg
+        self.file_obj = None
+        self.node_id_to_line_number = None
+        self.line_number_to_node_id = None
+
     def add_method(self , method):
         self.methods.add(method)
     

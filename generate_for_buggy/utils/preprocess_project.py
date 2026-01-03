@@ -8,6 +8,7 @@ from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
 from ..basic_class.base_class import Class
 from ..basic_class.base_test_program import TestProgram
+from ..cfg.src.comex.codeviews.combined_graph.combined_driver import CombinedDriver
 # from .cfg_generate import generate_cfg_for_file
 
 def find_java_files(directory):
@@ -36,7 +37,7 @@ def get_packages(project_path , src_path):
         try:
             with open(java_path, 'rb') as file:   # 二进制模式读文件
                 raw_data = file.read()
-            # 检测文件编码
+            # detect encode
             result = chardet.detect(raw_data)   # 通过chardet猜测编码方式再进行解码
             encoding = result['encoding']
             java_content = raw_data.decode(encoding)
@@ -170,24 +171,51 @@ def get_packages(project_path , src_path):
             arguments_list = tuple(method.parameters_list)
             method_map[(name, arguments_list)]= method
 
-    all_packages = list(all_packages_map.values()) 
-
     # cfg dfg
     # for sigle_file in all_files:
+    
+    for single_file in all_files:
+        file_content = single_file.content
+        cfg_driver = CombinedDriver('java' , file_content)
+        cfg_obj = cfg_driver.file_obj
+        cls_objs = cfg_obj['class_objects']
+
+        single_file.file_obj = cfg_obj
+        single_file.node_id_to_line_number = cfg_driver.node_id_to_line_number
+        single_file.line_number_to_node_id = cfg_driver.line_number_to_node_id
+
+        for cls_obj in cls_objs:
+            exist_class_flag = False
+            for classs in single_file.classes:
+                if classs.name_no_package == cls_obj['class_declaration']['name']:
+                    exist_class_flag = True
+                    break
+            if exist_class_flag:
+                for method_under_test in cls_obj["methods_under_test"]:
+                    method_name = method_under_test["method_declaration"]["name"]
+                    method_declaration_line = cfg_driver.node_id_to_line_number[method_under_test["method_declaration"]["id"]][0]
+                    for method in single_file.methods:
+                        if method.name_no_package == method_name and method_declaration_line in method.line_range:
+                            method.cfg_info = method_under_test
+                            break
+
+
+    all_packages = list(all_packages_map.values()) 
+
 
     for single_package in all_packages:
         find_call_method(single_package , method_map , class_map)
-        package_name = single_package.name
+        # package_name = single_package.name
 
-    print(len(all_files))
-    for single_file in all_files:
-        if single_file.file_name == "NumberUtils.java":
-            print(single_file.file_name + ":")
-            # generate_cfg_for_file(project_path , single_file)
-            # for classs in single_file.classes:
-            #     print(classs.name_no_package , classs.father_class_name)
-            #     for method in classs.methods:
-            #         print("    " + method.signature , method.return_type , method.line_range , method.import_map)
+    # print(len(all_files))
+    # for single_file in all_files:
+    #     if single_file.file_name == "NumberUtils.java":
+    #         print(single_file.file_name + ":")
+    #         # generate_cfg_for_file(project_path , single_file)
+    #         # for classs in single_file.classes:
+    #         #     print(classs.name_no_package , classs.father_class_name)
+    #         #     for method in classs.methods:
+    #         #         print("    " + method.signature , method.return_type , method.line_range , method.import_map)
     
     all_packages = list(all_packages_map.values()) 
 
@@ -253,7 +281,7 @@ def setup_all_packages(project_name , all_packages , method_map , class_map):
 
 def analyze_project(project_name):
     """
-        通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
+        static analysis the project
     """
     project_group = project_name.split('_')[0]   # eg: Lang
     project_path = os.path.join(CONFIG['mappings']['buggy_loc'] , project_group , project_name)

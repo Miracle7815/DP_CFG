@@ -18,7 +18,6 @@ class Method():
         self.return_type = return_type
         self.node = node
         
-        self.return_type = return_type
         self.return_class = None
 
         self.variable_map = {}
@@ -56,7 +55,13 @@ class Method():
         
         self.covered_tests = set()
 
+        # coverage info
+        self.missed_lines = set()
+        self.missed_brachese = set()
+
         # cfg
+        # self.declaration_value = None
+        self.cfg_info = None
 
     def get_package_name(self):
         return self.belong_package.name

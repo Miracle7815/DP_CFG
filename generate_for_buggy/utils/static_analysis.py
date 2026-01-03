@@ -150,6 +150,8 @@ def find_method(node , new_class , package , single_file):
         if is_static:
             method.is_static = True
         
+        # method.declaration_value = node.text.decode().strip()
+
         new_class.add_method(method)
         package.add_method(method)
         single_file.add_method(method)
