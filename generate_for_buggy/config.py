@@ -35,8 +35,5 @@ def init_logger(project_name="myproject"):
 
     logger.addHandler(handler)
     return logger
-
-def log_and_print(msg , **kwargs):
-    logger.info(msg)
     
 logger = init_logger(project_name="generate_for_buggy")
