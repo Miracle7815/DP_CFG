@@ -20,3 +20,15 @@ import json
 project_path = "/home/miracle/DP_CFG/data/project_under_test/Lang/Lang_1_buggy"
 src_path = "src/main/java"
 all_packages, method_map, class_map = get_packages(project_path , src_path)
+
+for package in all_packages:
+    for file in package.files:
+        if file.file_name == 'NumberUtils.java':
+            for method in file.methods:
+                print(f"{method.name} javadoc: ")
+                if method.javadoc is not None:
+                    print(method.javadoc)
+                else:
+                    print("No javadoc")
+                
+pass

@@ -29,6 +29,21 @@ public class LLMGeneratedTests extends FatherClass implements FatherInterface{
     int[][] array1 = new int[5][5];
     List<String> list = new ArrayList<>();
 
+    // Long.getLong(String,int)
+    // Long.getLong(String,Integer)
+    // Long.valueOf(String,int)
+    // Long.valueOf(String)
+    // Short.valueOf(String)
+    // Short.decode(String)
+    // Short.valueOf(String,int)
+    // Short.valueOf(String)
+    // new BigDecimal(String)
+    // new BigInteger(String)
+    // new BigInteger(String,int radix)
+    // Possible inputs:
+    // 45 45.5 45E7 4.5E7 Hex Oct Binary xxxF xxxD xxxf xxxd
+    // plus minus everything. Prolly more. A lot are not separable.
+
     /**
      * <p>Convert a <code>String</code> to an <code>int</code>, returning
      * <code>zero</code> if the conversion fails.</p>

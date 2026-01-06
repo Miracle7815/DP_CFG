@@ -1,6 +1,7 @@
 import os
 import sys
 import copy
+import re
 # import tree_sitter_java as ts_java
 from tree_sitter_languages import get_language
 from ..basic_class.base_class import Class
@@ -120,7 +121,7 @@ def find_method(node , new_class , package , single_file):
         parameters_node = node.child_by_field_name('parameters')
         if name_node is None or parameters_node is None:
             return 
-        
+
         parameter_modifiers = []
 
         method_name = name_node.text.decode()
@@ -144,6 +145,8 @@ def find_method(node , new_class , package , single_file):
         
         # (name_no_package , name , belong_package , belong_class , parameters_list , content , return_type , node)
         method = Method(method_name , f'{new_class.name}.{method_name}' , package , new_class , parameters , parameter_modifiers , method_content , method_return_type , node)
+        method.parameters_string = parameters_node.text.decode()
+
         if is_target:
             method.is_target = True
         
@@ -644,7 +647,7 @@ def get_method_name_and_arguments(node , classs , variable_map , package , metho
         return '', []
     
     import_map = classs.import_map
-    object_node = node.child_by_field_name('object')  # caller eg: foo.bar为foo
+    object_node = node.child_by_field_name('object')  # caller eg: foo.bar is foo
     method_name = node.child_by_field_name('name').text.decode()
     arguments_node = node.child_by_field_name('arguments')
     
@@ -851,6 +854,72 @@ def find_call_method(package , method_map , class_map):
             #     method.add_branch_related_called_method_name(method_signature)   # 与分支相关的调用方法
             # print(f'{method.name} variable_list {variable_list}')
             # print(f'{method.name} method_list {method_list}')
+
+def find_all_javadocs(node , javadoc_list):
+    if node.type == 'block_comment':
+        javadoc_list.append((node.end_point[0] , node.text.decode()))
+    
+    for child in node.children:
+        find_all_javadocs(child , javadoc_list)
+
+def clean_javadoc_ts(text: str) -> str:
+    # clean /** 和 */
+    text = re.sub(r'^/\*\*\s*', '', text)
+    text = re.sub(r'\s*\*/$', '', text)
+    # clean *
+    lines = text.split('\n')
+    cleaned = [re.sub(r'^\s*\*\s?', '', line) for line in lines]
+    cleaned = []
+    for line in lines:
+        if re.sub(r'^\s*\*\s?', '', line).strip() != '':
+            cleaned.append(re.sub(r'^\s*\*\s?', '', line))
+        
+
+    return '\n'.join(cleaned).strip()
+
+def find_method_java_doc(single_file):
+    source_code = single_file.content
+    tree = parser.parse(bytes(source_code, "utf8"))
+    root_node = tree.root_node
+    javadoc_list = []
+
+    find_all_javadocs(root_node , javadoc_list)
+    
+    for method in single_file.methods:
+        if single_file.file_name != 'NumberUtils.java' and method.name_no_package != 'createNumber':
+            continue
+
+        method_start_line = method.node.start_point[0]
+        for javadoc in javadoc_list:
+            javadoc_end_line = javadoc[0]
+            if javadoc_end_line != method_start_line - 1:
+                continue
+
+            javadoc_content = javadoc[1]
+            flag = True
+            for content_line in javadoc_content.split('\n'):
+                if content_line.strip().startswith('*') or content_line.strip().startswith('/**') or content_line.strip().startswith('*/'):
+                    continue
+
+                flag = False
+
+            params = []
+
+            if javadoc_content.startswith('/**') and flag:
+                cleaned_javadoc = clean_javadoc_ts(javadoc_content)
+                for content_line in cleaned_javadoc.split('\n'):
+                    if content_line.strip().startswith('@param'):
+                        param = content_line.strip().split(' ')[1].strip(' ,')
+                        params.append(param)
+                
+                if len(params) != len(method.parameters_list):
+                    continue
+
+                if len(params) != 0 and any(param not in method.parameters_string for param in params):
+                    continue
+                    
+                method.add_javadoc(cleaned_javadoc)
+                break
 
 
 def add_file_classes_and_methods_to_package(package , single_file):

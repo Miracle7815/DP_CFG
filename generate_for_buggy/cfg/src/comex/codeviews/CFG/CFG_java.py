@@ -263,7 +263,7 @@ class CFGGraph_java(CFGGraph):
 
         if reference_node is None or reference_node.type == "this":
             while node is not None:
-                if node.type == "class_declaration":
+                if node.type == "class_declaration" or node.type == "enum_declaration":
                     # class_index = self.get_index(node)
                     class_name = list(filter(lambda child: child.type == "identifier", node.children))[0]
                     class_name = [class_name.text.decode("UTF-8")]
@@ -376,6 +376,9 @@ class CFGGraph_java(CFGGraph):
                     except Exception as e:
                         pass
                 pointer_node = pointer_node.parent
+            
+            if parent_node is None:
+                parent_node = current_node.parent
             parent_index = self.get_index(parent_node)
             # maintain a list of all method invocations
             # IDENTIFY THE CLASS THAT THE ALIAS BELONGS TO AND USE THAT IN THE MAP MAYBE? 

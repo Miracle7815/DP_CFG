@@ -13,6 +13,7 @@ class Method():
         self.parameters_list = parameters_list
         self.parameters_modifiers_list = parameters_modifiers_list
         self.signature = ''
+        self.parameters_string = ''
 
         self.content = content
         self.return_type = return_type
@@ -24,6 +25,8 @@ class Method():
         self.import_map = {}
 
         self.line_range = set()
+
+        self.javadoc = None
 
         self.called_method_name = set()
         self.called_methods = set()
@@ -153,3 +156,6 @@ class Method():
         parameters_string = ','.join((modifier.strip() + " " if modifier != "no modifier" else "") + item for modifier , item in zip(self.parameters_modifiers_list , help_parameters_list))
         
         self.signature = f'{self.belong_package.name}#{self.belong_class.name_no_package}#{self.name_no_package}({parameters_string})'
+
+    def add_javadoc(self, javadoc):
+        self.javadoc = javadoc

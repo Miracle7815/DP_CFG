@@ -2,7 +2,7 @@ import os
 from queue import Queue
 import chardet
 from ..config import CONFIG , logger
-from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class , find_call_method
+from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class , find_call_method , find_method_java_doc
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
@@ -175,30 +175,34 @@ def get_packages(project_path , src_path):
     # for sigle_file in all_files:
     
     for single_file in all_files:
-        file_content = single_file.content
-        cfg_driver = CombinedDriver('java' , file_content)
-        cfg_obj = cfg_driver.file_obj
-        cls_objs = cfg_obj['class_objects']
+        try:
+            file_content = single_file.content
+            cfg_driver = CombinedDriver('java' , file_content)
+            cfg_obj = cfg_driver.file_obj
+            cls_objs = cfg_obj['class_objects']
 
-        single_file.file_obj = cfg_obj
-        single_file.node_id_to_line_number = cfg_driver.node_id_to_line_number
-        single_file.line_number_to_node_id = cfg_driver.line_number_to_node_id
+            single_file.file_obj = cfg_obj
+            single_file.node_id_to_line_number = cfg_driver.node_id_to_line_number
+            single_file.line_number_to_node_id = cfg_driver.line_number_to_node_id
 
-        for cls_obj in cls_objs:
-            exist_class_flag = False
-            for classs in single_file.classes:
-                if classs.name_no_package == cls_obj['class_declaration']['name']:
-                    exist_class_flag = True
-                    break
-            if exist_class_flag:
-                for method_under_test in cls_obj["methods_under_test"]:
-                    method_name = method_under_test["method_declaration"]["name"]
-                    method_declaration_line = cfg_driver.node_id_to_line_number[method_under_test["method_declaration"]["id"]][0]
-                    for method in single_file.methods:
-                        if method.name_no_package == method_name and method_declaration_line in method.line_range:
-                            method.cfg_info = method_under_test
-                            break
-
+            for cls_obj in cls_objs:
+                exist_class_flag = False
+                for classs in single_file.classes:
+                    if classs.name_no_package == cls_obj['class_declaration']['name']:
+                        exist_class_flag = True
+                        break
+                if exist_class_flag:
+                    for method_under_test in cls_obj["methods_under_test"]:
+                        method_name = method_under_test["method_declaration"]["name"]
+                        method_declaration_line = cfg_driver.node_id_to_line_number[method_under_test["method_declaration"]["id"]][0]
+                        for method in single_file.methods:
+                            if method.name_no_package == method_name and method_declaration_line in method.line_range:
+                                method.cfg_info = method_under_test
+                                break
+        except Exception as e:
+            single_file.file_obj = None
+            single_file.node_id_to_line_number = None
+            single_file.line_number_to_node_id = None
 
     all_packages = list(all_packages_map.values()) 
 
@@ -207,6 +211,8 @@ def get_packages(project_path , src_path):
         find_call_method(single_package , method_map , class_map)
         # package_name = single_package.name
 
+    for single_file in all_files:
+        find_method_java_doc(single_file)
     # print(len(all_files))
     # for single_file in all_files:
     #     if single_file.file_name == "NumberUtils.java":
