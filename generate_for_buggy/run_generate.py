@@ -2,13 +2,27 @@ import time
 import os
 import json
 import traceback
-from config import CONFIG , logger , code_baseModuleNotFoundError
-from utils.preprocess_project import analyze_project
+from .config import CONFIG , logger
+from .utils.preprocess_project import analyze_project , delete_existing_case_and_save
+from .utils.process_project_info import process_method_info , get_callable_method
+from .utils.file_operation import create_directory
 
 time_dict = {}
 
+def run_method(target_method , project_name , all_packages , method_map , class_map , json_writer):
+    group = project_name.split('_')[0]
+    project_root = os.path.join(CONFIG['mappings']['buggy_loc'] , group , project_name + "_buggy")
+    test_root_dir = CONFIG['mappings']['test']
+    src_root_dir = CONFIG['mappings']['src']
+
+    package_name = target_method.get_package_name()
+    
+
 def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
-    json_res_file = os.path.join(json_res_dir, project_name + '.jsonl')
+    group = project_name.split('_')[0]
+    json_res_file = os.path.join(json_res_dir , group , project_name + '.jsonl')
+    create_directory(os.path.join(json_res_dir , group))
+
     json_writer = open(json_res_file, "w" , encoding='utf-8')
     
     time_dict[project_name] = {}  # 记录时间
@@ -17,20 +31,46 @@ def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     # logger.debug(f"Before static analysis, recover existing case in projcet {project_name}")
     # recovery_existing_case(project_name, tmp_test_dir)
     
-    # 通过静态分析提取到项目中的代码调用关系, 以及现有测试程序对应方法的映射
+    # static analysis
     logger.debug(f"Begin static analysis project for {project_name}")
     all_packages, method_map, class_map = analyze_project(project_name + "_buggy")
     logger.debug(f"Finish static analysis project for {project_name}")
     
-    # # 在项目中把已有的test都删掉，节省编译时间
-    # logger.debug(f"Begin deleting existing case in projcet {project_name}")
-    # delete_existing_case_and_save(project_name, tmp_test_dir)
-    # logger.debug(f"Finish deleting existing case in projcet {project_name}")
+    # delete exist test
+    logger.debug(f"Begin deleting existing case in projcet {project_name}")
+    delete_existing_case_and_save(project_name + "_buggy", tmp_test_dir)
+    logger.debug(f"Finish deleting existing case in projcet {project_name}")
     
-    # all_callable_methods = []
-    # if debugging_mode:
-    #     all_packages = [i for i in all_packages if i.name == 'org.llm']
+    callable_methods = []
     
+    logger.info(f"Collecting target methods...")
+
+    try:
+        class_method_map = process_method_info(project_name , CONFIG['mappings']['src'])
+
+        for class_name , method_info in class_method_map.item():
+            callable_method = get_callable_method(all_packages , class_name , method_info)
+            if callable_method is None:
+                continue
+            callable_methods.append(callable_method)
+        
+        logger.info(f"Collect {len(callable_methods)} target methods.")
+
+        for index , target_method in enumerate(callable_methods):
+            logger.info(f"Processing target method: {target_method.signature},  {index + 1} / {len(callable_methods)}")
+
+            run_time = time.time()
+            run_method(target_method , project_name , all_packages , method_map , class_map , json_writer)
+            run_time = time.time() - run_time
+            logger.debug(f"Time elapsed: {run_time}")
+            
+            time_dict[project_name][target_method.signature] = run_time
+            logger.debug(f"Generation for target: {target_method.signature}, {index + 1} / {len(callable_methods)} finished!\n\n")
+
+    except Exception as e:
+        print('Exception:' , e)
+         
+
     # collect_type = CONFIG['path_mappings'][project_name]['test_scale']   # collect_type = method
     # logger.debug(f"Collecting target methods.")
     # try:

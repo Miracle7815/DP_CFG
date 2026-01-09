@@ -62,6 +62,7 @@ public class LLMGeneratedTests extends FatherClass implements FatherInterface{
      * @since 2.1
      */
     public static ResResult<UserVO> register(UserVO userVO , final @Nonull int x , String str){
+        ClassA.ClassB classab = a.new ClassB();
         a(true);
         return true;
     }
@@ -228,6 +229,17 @@ for child in class_node.child_by_field_name('body').children:
                         for child_child in var_value_node.children:
                             print("yes ", child_child.type , child_child.text.decode() , end="  ")
         print()
+
+for lchild in method_node.child_by_field_name('body').children:
+    if lchild.type == 'local_variable_declaration':
+        for child in lchild.children:
+            print(child.type , child.text.decode())
+            for rchild in child.children:
+                if rchild.type == "object_creation_expression":
+                    class_name = rchild.child_by_field_name('type').text.decode()
+                    print("created object of class: " , class_name)
+                    for child_child in rchild.children:
+                        print("yes ", child_child.type , child_child.text.decode())
 
 
 print("-----------------------")

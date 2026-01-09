@@ -34,6 +34,7 @@ class Method():
         self.called_chains = []
         self.callee_chains = []
 
+
         self.branch_related_called_methods_name = set()
         self.branch_related_called_methods = set()
 
@@ -93,17 +94,17 @@ class Method():
     def add_callee_method(self, method):
         self.callee_methods.add(method)
         
-    def add_called_chain(self, chain):
-        self.called_chains.append(chain)
+    # def add_called_chain(self, chain):
+    #     self.called_chains.append(chain)
     
-    def add_callee_chain(self, chain):
-        self.callee_chains.append(chain)
+    # def add_callee_chain(self, chain):
+    #     self.callee_chains.append(chain)
     
-    def add_branch_related_called_method_name(self, signature):
-        self.branch_related_called_methods_name.add(signature)
+    # def add_branch_related_called_method_name(self, signature):
+    #     self.branch_related_called_methods_name.add(signature)
         
-    def add_branch_related_called_method(self, method):
-        self.branch_related_called_methods.add(method)
+    # def add_branch_related_called_method(self, method):
+    #     self.branch_related_called_methods.add(method)
         
     def set_target(self):
         self.is_target = True

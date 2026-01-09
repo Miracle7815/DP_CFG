@@ -254,13 +254,6 @@ def find_import(node , single_file , package_map , method_map):
                                     single_file.import_static_method[(method.name, tuple(method.parameters_list))] = method
                                     find_flag = True
                                     break
-                            
-                            if not find_flag:
-                                # static field   will be updated in later analysis
-                                single_file.import_static_field[import_node.text.decode()] = method_or_field_name
-                            # for field_name , field in classs.fields.items():
-                            #     if field_name == method_or_field_name and field['is_static']:
-                            #         single_file.import_static_field[field_name] = field
                 else:
                     if whole_class_name in single_file.import_static_jdk_map:
                         if not single_file.import_static_jdk_map[whole_class_name]['all']:
@@ -570,43 +563,43 @@ def find_method_variable(node , variable_map , method):
     for child in node.children:
         find_method_variable(child, variable_map, method)
 
-# 辅助函数： 获取一个函数调用的返回类型
+# get the type of method return
 def get_method_return(method_name, arguments_list, package, method_map):
     if (method_name, tuple(arguments_list)) in method_map:
-        if isinstance(method_map[method_name, tuple(arguments_list)].return_type , Class):
-            pass
+        # if isinstance(method_map[method_name, tuple(arguments_list)].return_type , Class):
+        #     pass
         return method_map[method_name, tuple(arguments_list)].return_type
     return method_name
 
-# 辅助函数：获取方法调用时传入参数的类型
-def get_type_of_method_invocation(node, classs, variable_map, package, method_map, class_map, method_cache):
+# get type of arguments
+def get_type_of_method_invocation(node, classs, variable_map, package, single_file, method_map, class_map, method_cache):
     import_map = classs.import_map
-    if node.type == 'cast_expression':   # 类型转换 提取括号内部再分析
+    if node.type == 'cast_expression':   # type casting
         type_node = node.child_by_field_name('type')
         if type_node is None:
             return None
-        return get_type_of_method_invocation(type_node, classs, variable_map, package, method_map, class_map, method_cache)
+        return get_type_of_method_invocation(type_node, classs, variable_map, package, single_file, method_map, class_map, method_cache)
     elif node.type == 'field_access':     # obj.fieldName
         obj_node = node.child_by_field_name('object')
         field_node = node.child_by_field_name('field')
         if obj_node is None or field_node is None:
             return None
-        if obj_node.type == 'this':  # this只返回fieldName
+        if obj_node.type == 'this': 
             field_name = field_node.text.decode()
             return variable_map[field_name] if field_name in variable_map else field_name
-        elif obj_node.type == 'identifier':  # 返回obj.fieldName
+        elif obj_node.type == 'identifier':  # obj.fieldName
             obj_name = obj_node.text.decode()
             obj_name = variable_map[obj_name] if obj_name in variable_map else obj_name
             field_name = field_node.text.decode()
             return f'{obj_name}.{field_name}'
             
-    elif node.type == 'array_access':  # 数组
+    elif node.type == 'array_access':  # array[i]
         type_node = node.child_by_field_name('array')
         if type_node is None:
             return None
         array_name = type_node.text.decode()
         array_type = variable_map[array_name] if array_name in variable_map else array_name
-        return array_type.split('[')[0]  # 返回单个元素类型
+        return array_type.split('[')[0]  # return element type
     elif node.type == 'true' or node.type == 'false':
         return 'boolean'
     elif node.type == 'decimal_integer_literal':
@@ -617,33 +610,31 @@ def get_type_of_method_invocation(node, classs, variable_map, package, method_ma
         return 'String'
     elif node.type == 'type_identifier':
         return import_map[node.text.decode()] if node.text.decode() in import_map else node.text.decode()
-    elif node.type == 'identifier':   # 变量
+    elif node.type == 'identifier':   # variable
         return variable_map[node.text.decode()] if node.text.decode() in variable_map else node.text.decode()
-    elif node.type == 'binary_expression': # 二元表达式  取左边表达式类型为结果
-        return get_type_of_method_invocation(node.child_by_field_name('left'), classs, variable_map, package, method_map, class_map, method_cache)
-    elif node.type == 'method_invocation':  # 参数方法调用的结果
+    elif node.type == 'binary_expression': # expr
+        return get_type_of_method_invocation(node.child_by_field_name('left'), classs, variable_map, package, single_file, method_map, class_map, method_cache)
+    elif node.type == 'method_invocation':  # method invocation result
         if node.text.decode() in method_cache:   
             (method_name, arguments_list) = method_cache[node.text.decode()]
         else:
-            method_name, arguments_list = get_method_name_and_arguments(node, classs, variable_map, package, method_map, class_map, method_cache)
+            method_name, arguments_list = get_method_name_and_arguments(node, classs, variable_map, package, single_file, method_map, class_map, method_cache)
             method_cache[node.text.decode()] = (method_name, arguments_list)
         return get_method_return(method_name, arguments_list, package, method_map)
-    elif node.type == 'object_creation_expression': # a.new Classa()       # 创建类型 new Class()
+    elif node.type == 'object_creation_expression': # a.new Classa()
         variable_class = node.child_by_field_name('type').text.decode() #  A.B String
         for child in node.children:
             if child.type == 'identifier':
                 variable_class = variable_map[child.text.decode()] + '.' + variable_class
-        return import_map[variable_class] if variable_class in import_map else variable_class # 去import map里面找全名，找不到就直接存进去
+        return import_map[variable_class] if variable_class in import_map else variable_class
     
-    # elif node.type == 'array_creation_expression':
-    #     pass
     return None
 
-# 辅助函数：获取一个函数调用的完整名字和参数列表
-def get_method_name_and_arguments(node , classs , variable_map , package , method_map , class_map , method_cache , depth=1):
+# get whole method name and arguments list
+def get_method_name_and_arguments(node , classs , variable_map , package , single_file , method_map , class_map , method_cache , depth=1):
     if node.text.decode() in method_cache:
         return method_cache[node.text.decode()]
-    if depth > 5:   # 递归深度
+    if depth > 5: 
         return '', []
     
     import_map = classs.import_map
@@ -651,22 +642,23 @@ def get_method_name_and_arguments(node , classs , variable_map , package , metho
     method_name = node.child_by_field_name('name').text.decode()
     arguments_node = node.child_by_field_name('arguments')
     
-    # 获取方法调用的类
     if object_node is None:
-        invocation_class = classs.name   # 没有前缀，调用本类的方法
-    elif object_node.type == 'method_invocation':   # 调用者是另一个方法的结果 obj.getService().run()
-        if object_node.text.decode() in method_cache:   
-            (method_name, arguments_list) = method_cache[object_node.text.decode()]   # 调用的语句 : (method_name , arguments_list)
+        if method_name in single_file.import_static_method:
+            for method_info , method in single_file.import_static_method.items():
+                if method_info[0] == method_name:
+                    invocation_class = method.belong_class.name
+                    break
         else:
-            method_name, arguments_list = get_method_name_and_arguments(object_node, classs, variable_map, package, method_map, class_map, method_cache, depth + 1)
+            invocation_class = classs.name
+    elif object_node.type == 'method_invocation':   # eg: obj.getService().run()
+        if object_node.text.decode() in method_cache:   
+            (method_name, arguments_list) = method_cache[object_node.text.decode()]   # call statement : (method_name , arguments_list)
+        else:
+            method_name, arguments_list = get_method_name_and_arguments(object_node, classs, variable_map, package , single_file , method_map, class_map, method_cache, depth + 1)
             method_cache[object_node.text.decode()] = (method_name, arguments_list)
-        invocation_class = get_method_return(method_name, arguments_list, package, method_map)   # 调用者的返回类型 eg: obj.getService() return org.demo.Service
-        if isinstance(invocation_class , Class):
-            pass
+        invocation_class = get_method_return(method_name, arguments_list, package, method_map)   # eg: obj.getService() return org.demo.Service
         if invocation_class is None:
             invocation_class = object_node.text.decode()
-        if isinstance(invocation_class , Class):
-            pass
     elif object_node.type == 'super' and classs.father_class is not None:   # super.method()
         invocation_class = classs.father_class.name
     elif object_node.type == 'this':  # this.method()
@@ -675,17 +667,15 @@ def get_method_name_and_arguments(node , classs , variable_map , package , metho
         invocation_class = object_node.text.decode()
         if 'this.' in invocation_class:
             invocation_class = invocation_class.split('.')[-1]   # this.foo().bar()
-    # 优先局部变量， import中的类型，最后是原名
+    # local > import
     invocation_class = variable_map[invocation_class] if invocation_class in variable_map else import_map[invocation_class] if invocation_class in import_map else invocation_class
     
-    # 获取方法调用的函数列表
     arguments_list = []
     for child in arguments_node.children:
-        argument_type = get_type_of_method_invocation(child, classs, variable_map, package, method_map, class_map, method_cache)
+        argument_type = get_type_of_method_invocation(child, classs, variable_map, package, single_file, method_map, class_map, method_cache)
         # eg: foo.bar(a, user.getName(), new Person()); =》 arguments_list = ["int", "java.lang.String", "org.demo.Person"]
         if argument_type != None:
-            # 处理'field_access'
-            if '.' in argument_type:  # 分解为class名 + 变量名
+            if '.' in argument_type:   # field access
                 class_name = '.'.join(argument_type.split('.')[0 : -1])
                 variable_name = argument_type.split('.')[-1]
                 called_class = class_map.get(class_name)
@@ -693,7 +683,7 @@ def get_method_name_and_arguments(node , classs , variable_map , package , metho
                     called_variable_map = called_class.variable_map
                     variable_type = called_variable_map.get(variable_name)
                     if variable_type is not None:
-                        argument_type = variable_type     # 修改为该变量在类中存储的类型 # eg: class A {Address address;} 则 org.demo.A.address => org.demo.Address
+                        argument_type = variable_type
                 
             arguments_list.append(argument_type)
 
@@ -701,25 +691,25 @@ def get_method_name_and_arguments(node , classs , variable_map , package , metho
 
 
 # find method call
-def find_method_invocation(node , classs , method , variable_map , package , method_map , class_map , method_cache):
+def find_method_invocation(node , classs , method , variable_map , package , single_file , method_map , class_map , method_cache):
     import_map = method.import_map
-    if node.type == 'method_invocation': # 直接的方法调用
+    if node.type == 'method_invocation': # method call
         if node.text.decode() in method_cache:   
             (method_name, arguments_list) = method_cache[node.text.decode()]
         else:
-            method_name, arguments_list = get_method_name_and_arguments(node, classs, variable_map, package, method_map, class_map, method_cache)  # 获得方法名和参数列表
+            method_name, arguments_list = get_method_name_and_arguments(node, classs, variable_map, package, single_file , method_map, class_map, method_cache)
             method_cache[node.text.decode()] = (method_name, arguments_list)
-        method.add_call_method_name(method_name, arguments_list)   # 该函数调用的方法名和参数列表
-    if node.type == 'object_creation_expression': # 实例化对象的时候会调用一次构造函数  new Class()
+        method.add_call_method_name(method_name, arguments_list)
+    if node.type == 'object_creation_expression': # new Class()
         class_name = node.child_by_field_name('type').text.decode() #  A.B String
-        for child in node.children:  # Outer.Inner
-            if child.type == 'identifier':
+        for child in node.children:  
+            if child.type == 'identifier':   # outer.new Inner()
                 class_name = variable_map[child.text.decode()] + '.' + class_name
         method_name = import_map[class_name] + '.' + class_name if class_name in import_map else class_name + '.' +  class_name # 去import map里面找全名，找不到就直接存进去
         arguments_node = node.child_by_field_name('arguments')
         arguments_list = []
         for child in arguments_node.children:
-            argument_type = get_type_of_method_invocation(child, classs, variable_map, package, method_map, class_map, method_cache)
+            argument_type = get_type_of_method_invocation(child, classs, variable_map, package, single_file, method_map, class_map, method_cache)
             if argument_type != None:
                 arguments_list.append(argument_type)
         # # print(f'method {method.name}调用:')
@@ -728,7 +718,7 @@ def find_method_invocation(node , classs , method , variable_map , package , met
         method.add_call_method_name(method_name, arguments_list)
     
     for child in node.children:
-        find_method_invocation(child, classs, method, variable_map, package, method_map, class_map, method_cache)
+        find_method_invocation(child, classs, method, variable_map, package, single_file, method_map, class_map, method_cache)
 
 
 # # 辅助函数：找到结点中的变量和函数
@@ -823,12 +813,16 @@ def find_call_method(package , method_map , class_map):
     for classs in package.classes:
         class_node = classs.node
         variable_map = classs.variable_map
+        single_file = classs.belong_file
 
         for method in classs.methods:
             method_node = method.node
             method_variable_map = method.variable_map
             # call method and constructor
-            find_method_invocation(method_node , classs , method , method_variable_map , package , method_map , class_map , method_cache)
+            if method.name == "org.apache.commons.lang3.math.NumberUtils.toInt":
+                pass
+
+            find_method_invocation(method_node , classs , method , method_variable_map , package , single_file , method_map , class_map , method_cache)
             # variable_list = []
             # method_list = []
             # find_branch_related(method_node, method, classs, method_variable_map, variable_list, method_list, package, method_map, class_map, method_cache)
@@ -920,6 +914,60 @@ def find_method_java_doc(single_file):
                     
                 method.add_javadoc(cleaned_javadoc)
                 break
+
+def find_static_field(node , single_file , package_map):
+    if node.type == 'import_declaration':
+        flag = False
+        is_static = False
+        import_node = None
+        # import static java.util.*
+        for child in node.children:
+            if child.type == 'asterisk':  # 代表有import *
+                flag = True
+            if child.type == 'scoped_identifier' or child.type == 'identifier':
+                import_node = child # com.exampke.classA
+            if child.type == 'static':
+                is_static = True
+        # print(flag)
+        if flag and import_node is not None:   # 如果 import * 就把这个包的所有class和method加入到single_file.import_map和method_map中
+            if is_static:
+                class_name = import_node.text.decode()   # import static package_name.class_name.*
+                package_name = '.'.join(class_name.split('.')[:-1])
+                if package_name in package_map:
+                    package = package_map[package_name]
+                    for classs in package.classes:
+                        if classs.name_no_package == class_name.split('.')[-1]:
+                            for field_name , field_value in classs.fields.item():
+                                if "public" in field_value and "static" in field_value:
+                                    single_file.import_static_field[field_name] = field_value
+        elif import_node is not None:
+            if is_static:
+                field_name_node = import_node.child_by_field_name('name')
+                package_name = '.'.join(import_node.child_by_field_name('scope').text.decode().split('.')[: -1])
+                class_name = import_node.child_by_field_name('scope').text.decode().split('.')[-1]
+                field_name = field_name_node.text.decode()
+                whole_class_name = import_node.child_by_field_name('scope').text.decode()
+
+                if package_name in package_map:
+                    single_package = package_map[package_name]
+                    for classs in single_package.classes:
+                        if classs.name_no_package == class_name:
+                            if field_name in classs.fields:
+                                single_file.import_static_field[field_name] = classs.fields[field_name]
+    
+    for child in node.children:
+        find_static_field(child, single_file, package_map)
+
+
+def find_import_static_field(single_file , all_packages):
+    tree = parser.parse(bytes(single_file.content , "utf8"))
+    root_node = tree.root_node
+
+    package_map = {}
+    for single_package in all_packages:
+        package_map[single_package.name] = single_package
+    
+    find_static_field(root_node , single_file , package_map)
 
 
 def add_file_classes_and_methods_to_package(package , single_file):

@@ -2,13 +2,14 @@ import os
 from queue import Queue
 import chardet
 from ..config import CONFIG , logger
-from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class , find_call_method , find_method_java_doc
+from .static_analysis import find_package_name_use_source_code , add_file_classes_and_methods_to_package , get_package_import , find_father_class , find_call_method , find_method_java_doc , find_import_static_field
 from ..basic_class.base_package import Package
 from ..basic_class.base_method import Method
 from ..basic_class.base_file import File
 from ..basic_class.base_class import Class
 from ..basic_class.base_test_program import TestProgram
 from ..cfg.src.comex.codeviews.combined_graph.combined_driver import CombinedDriver
+from .file_operation import create_directory_temp_test , write_to_file , remove_file
 # from .cfg_generate import generate_cfg_for_file
 
 def find_java_files(directory):
@@ -212,6 +213,9 @@ def get_packages(project_path , src_path):
         # package_name = single_package.name
 
     for single_file in all_files:
+        find_import_static_field(single_file , all_packages)
+
+    for single_file in all_files:
         find_method_java_doc(single_file)
     # print(len(all_files))
     # for single_file in all_files:
@@ -235,7 +239,6 @@ def setup_single_package(all_methods_in_package , method_map , class_map):
             called_methods = []
             if name_and_arguments_list in method_map:
                 called_methods = [method_map[name_and_arguments_list]]
-            # 粗粒度 已经实现对于名字相同的方法，通过参数列表长度锁定
             else:
                 called_class_name = '.'.join(name_and_arguments_list[0].split('.')[:-1])
                 called_class = class_map.get(called_class_name)
@@ -254,19 +257,19 @@ def setup_single_package(all_methods_in_package , method_map , class_map):
                 called_method.add_callee_method(single_method)
                 called_class_name = '.'.join(name_and_arguments_list[0].split('.')[:-1])
                 called_class = class_map.get(called_class_name)
-                single_method.add_called_method_and_class(single_method, called_class)
+                single_method.add_called_method_and_class(called_method , called_class)
                         
-        # 与分支相关的方法
-        for name_and_arguments_list in single_method.branch_related_called_methods_name:
-            branch_related_called_method = None
-            if name_and_arguments_list in method_map:
-                branch_related_called_method = method_map[name_and_arguments_list]
+        # # 与分支相关的方法
+        # for name_and_arguments_list in single_method.branch_related_called_methods_name:
+        #     branch_related_called_method = None
+        #     if name_and_arguments_list in method_map:
+        #         branch_related_called_method = method_map[name_and_arguments_list]
                 
-            if branch_related_called_method is not None:
-                single_method.add_branch_related_called_method(branch_related_called_method)
-                branch_related_called_class_name = '.'.join(name_and_arguments_list[0].split('.')[:-1])
-                branch_related_called_class = class_map.get(branch_related_called_class_name)
-                single_method.add_branch_related_called_methods_and_class(branch_related_called_method, branch_related_called_class)
+        #     if branch_related_called_method is not None:
+        #         single_method.add_branch_related_called_method(branch_related_called_method)
+        #         branch_related_called_class_name = '.'.join(name_and_arguments_list[0].split('.')[:-1])
+        #         branch_related_called_class = class_map.get(branch_related_called_class_name)
+        #         single_method.add_branch_related_called_methods_and_class(branch_related_called_method, branch_related_called_class)
 
     # for single_method in all_methods_in_package:
     #     paths_from_single_func = find_all_chains(single_method)
@@ -297,6 +300,75 @@ def analyze_project(project_name):
     all_packages, method_map, class_map = get_packages(project_path , src_path)
     setup_all_packages(project_name, all_packages, method_map, class_map)
     return all_packages, method_map, class_map
+
+def find_test_files(project_root , test_root):
+    existing_test = []
+    
+    files = find_java_files(test_root)
+    for file in files:
+        if "test" in file.lower():
+            with open(file , 'r' , encoding='utf-8') as f:
+                content = f.read()
+            test_class_sig = file.replace(test_root + '/' , "")
+            test_class_sig = test_class_sig.replace(os.path.sep , '.')
+
+            existing_test.append({
+                "project_root": project_root,
+                "test_root": test_root,
+                "test_class_sig": test_class_sig,
+                "test_content": content
+            })
+    
+    return existing_test
+
+
+def save_test_class(test_class_sig , test_content , save_dir):
+    class_name = test_class_sig.split('.')[-2]
+    package_name = '.'.join(test_class_sig.split('.')[:-2])
+
+    if not package_name or not class_name:
+        return
+    
+    package_path = create_directory_temp_test(save_dir , package_name)
+
+    test_file_path = os.path.join(package_path , class_name + '.java')
+    
+    write_to_file(test_file_path , test_content)
+
+
+def clear_test_class(project_root , test_root , test_class_sig):
+    class_name = test_class_sig.split('.')[-2]
+    package_name = '.'.join(test_class_sig.split('.')[:-2])
+
+    if not package_name or not class_name:
+        return
+
+    package_name = package_name.replace('.' , os.sep)
+    package_path = os.path.join(test_root , package_name)
+
+    test_file_path = os.path.join(package_path , class_name + '.java')
+
+    remove_file(test_file_path)
+
+
+def delete_test_class_and_save(project_root , test_root , test_class_sig , test_content , tmp_test_dir , project_name):
+    project_group = project_name.split('_')[0]
+    save_project_path = os.path.join(tmp_test_dir , project_group , project_name)
+    
+    save_test_class(test_class_sig , test_content , save_project_path)
+#    clear_test_class(project_root , test_root , test_class_sig)
+
+def delete_existing_case_and_save(project_name, tmp_test_dir):
+    project_group = project_name.split('_')[0]   # eg: Lang
+    project_path = os.path.join(CONFIG['mappings']['buggy_loc'] , project_group , project_name)
+    project_root = os.path.join(project_path , CONFIG['mappings']['src'])
+    test_root = os.path.join(project_path , CONFIG['mappings']['test'])
+
+    existing_test = find_test_files(project_root , test_root)
+
+    for test_info in existing_test:
+        delete_test_class_and_save(test_info["project_root"] , test_info["test_root"] , test_info["test_class_sig"] , test_info["test_content"] , tmp_test_dir , project_name)
+        
 
 # if __name__ == "__main__":
 #     project_path = "/home/miracle/DP_CFG/project_under_test/Lang/Lang_1_buggy"
