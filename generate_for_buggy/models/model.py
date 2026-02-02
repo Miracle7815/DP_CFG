@@ -1,7 +1,7 @@
 import sys
 import threading
 from abc import ABC , abstractmethod
-from ..config import log_and_print
+# from ..config import log_and_print
 
 thread_cost = threading.local()      
 # thread_cost.process_cost = 0.0
@@ -15,7 +15,7 @@ class Model(ABC):
         time_out: int = 100,
         parallel_tool_call: bool = False,
     ):
-        self.model: str = model_name
+        self.model_name: str = model_name
         # cost stats - zero for local models
         # self.cost_per_input: float = cost_per_input
         # self.cost_per_output: float = cost_per_output
@@ -26,9 +26,9 @@ class Model(ABC):
         self.api_key = None
         self.base_url = None
 
-    @abstractmethod
-    def setup(self , api_key , base_url) -> None:
-        raise NotImplementedError("abstract base class")
+    # @abstractmethod
+    # def setup(self , api_key , base_url) -> None:
+    #     raise NotImplementedError("abstract base class")
 
     @abstractmethod
     def call(self, messages: list[dict], **kwargs):
@@ -63,3 +63,20 @@ class Model(ABC):
             + thread_cost.process_output_tokens,
             # "total_cost": thread_cost.process_cost,
         }
+
+
+
+
+SELECTED_MODEL: Model
+
+REVIEW_MODEL: Model
+
+def set_model(model , api_key , base_url):
+    global SELECTED_MODEL
+    SELECTED_MODEL = model
+    SELECTED_MODEL.setup(api_key , base_url)
+
+def set_review_model(model , api_key , base_url):
+    global REVIEW_MODEL
+    REVIEW_MODEL = model
+    REVIEW_MODEL.setup(api_key , base_url)

@@ -700,6 +700,7 @@ def find_method_invocation(node , classs , method , variable_map , package , sin
             method_name, arguments_list = get_method_name_and_arguments(node, classs, variable_map, package, single_file , method_map, class_map, method_cache)
             method_cache[node.text.decode()] = (method_name, arguments_list)
         method.add_call_method_name(method_name, arguments_list)
+        method.add_call_method_position(method_name , arguments_list , node.start_point[0])
     if node.type == 'object_creation_expression': # new Class()
         class_name = node.child_by_field_name('type').text.decode() #  A.B String
         for child in node.children:  
@@ -716,7 +717,8 @@ def find_method_invocation(node , classs , method , variable_map , package , sin
         # # print(method_name)
         # # print(arguments_list)
         method.add_call_method_name(method_name, arguments_list)
-    
+        method.add_call_method_position(method_name , arguments_list , node.start_point[0])
+        
     for child in node.children:
         find_method_invocation(child, classs, method, variable_map, package, single_file, method_map, class_map, method_cache)
 

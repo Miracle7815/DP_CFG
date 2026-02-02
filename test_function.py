@@ -259,3 +259,7 @@ for child in class_node.child_by_field_name('body').children:
 
 for child in class_node.children:
     print(child.type , child.text.decode())
+
+
+str = "123 {class_name}"
+print(str.format(class_name = "{yes}"))

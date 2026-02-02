@@ -9,7 +9,7 @@ def get_method_info(project_name):
     with open(info_file_path , 'r' , encoding='utf-8') as f:
         info_json = json.load(f)
     
-    print(info_json)
+    # print(info_json)
     return info_json
 
 def process_method_info(project_name , project_root):
@@ -41,7 +41,7 @@ def get_callable_method(all_packages , class_name , method_info):
     package_name = ".".join(class_name.split('.')[:-1])
     target_package = None
     for package in all_packages:
-        if package_name == package.package_name:
+        if package_name == package.name:
             target_package = package
             break
     
@@ -59,6 +59,8 @@ def get_callable_method(all_packages , class_name , method_info):
 
     target_method = None
     for method in target_class.methods:
+        # if method.name_no_package == "createNumber":
+        #     pass
         if method.name_no_package == method_info[0]:
             if all(method_parameter.strip() in method.parameters_string for method_parameter in method_info[1].split(',')) and method_info[2].strip() in method.return_type:
                 target_method = method

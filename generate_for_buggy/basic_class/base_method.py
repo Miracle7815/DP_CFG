@@ -29,6 +29,7 @@ class Method():
         self.javadoc = None
 
         self.called_method_name = set()
+        self.called_method_site = set()
         self.called_methods = set()
         self.callee_methods = set()
         self.called_chains = []
@@ -87,6 +88,9 @@ class Method():
     
     def add_call_method_name(self, method_name, arguments_list):
         self.called_method_name.add((method_name, tuple(arguments_list)))
+
+    def add_call_method_position(self , method_name , arguments_list , start_line):
+        self.called_method_site.add((method_name, tuple(arguments_list) , start_line))
         
     def add_called_method(self, method):
         self.called_methods.add(method)

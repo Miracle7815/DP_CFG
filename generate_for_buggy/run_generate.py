@@ -6,6 +6,8 @@ from .config import CONFIG , logger
 from .utils.preprocess_project import analyze_project , delete_existing_case_and_save
 from .utils.process_project_info import process_method_info , get_callable_method
 from .utils.file_operation import create_directory
+from .agents.agent_requirement import RequirementAgent
+from .agents.agent_reviewer import ReviewAgent
 
 time_dict = {}
 
@@ -16,7 +18,14 @@ def run_method(target_method , project_name , all_packages , method_map , class_
     src_root_dir = CONFIG['mappings']['src']
 
     package_name = target_method.get_package_name()
-    
+
+    requirement_agent = RequirementAgent(project_name , all_packages , class_map , method_map)
+
+    requirement_agent.write_requirement_for_method(target_method)
+
+    # review_agent = ReviewAgent('requirement')
+    # review_agent.review_requirement(project_name , target_method)
+
 
 def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     group = project_name.split('_')[0]
@@ -32,14 +41,14 @@ def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     # recovery_existing_case(project_name, tmp_test_dir)
     
     # static analysis
-    logger.debug(f"Begin static analysis project for {project_name}")
+    logger.info(f"Begin static analysis project for {project_name}")
     all_packages, method_map, class_map = analyze_project(project_name + "_buggy")
-    logger.debug(f"Finish static analysis project for {project_name}")
+    logger.info(f"Finish static analysis project for {project_name}")
     
     # delete exist test
-    logger.debug(f"Begin deleting existing case in projcet {project_name}")
+    logger.info(f"Begin deleting existing case in projcet {project_name}")
     delete_existing_case_and_save(project_name + "_buggy", tmp_test_dir)
-    logger.debug(f"Finish deleting existing case in projcet {project_name}")
+    logger.info(f"Finish deleting existing case in projcet {project_name}")
     
     callable_methods = []
     
@@ -48,8 +57,9 @@ def run_projcet(project_name, json_res_dir, tmp_test_dir=None):
     try:
         class_method_map = process_method_info(project_name , CONFIG['mappings']['src'])
 
-        for class_name , method_info in class_method_map.item():
-            callable_method = get_callable_method(all_packages , class_name , method_info)
+        for class_name , method_infos in class_method_map.items():
+            for method_info in method_infos:
+                callable_method = get_callable_method(all_packages , class_name , method_info)
             if callable_method is None:
                 continue
             callable_methods.append(callable_method)
@@ -108,7 +118,7 @@ def run(json_res_dir , tmp_test_dir):
     # todo_projects = [project for project in list(CONFIG['path_mappings'].keys())]
 
     todo_list = []
-    data_list_path = os.path.join(os.path.dirname(__file__) , '..' , 'data' , 'defects4j_list.txt')
+    data_list_path = os.path.join(os.path.dirname(__file__) , '..' , 'analyse_result' , 'no_add_and_delete_result.txt')
 
     with open(data_list_path , 'r' , encoding='utf-8') as f:
         contents = f.readlines()
@@ -120,43 +130,43 @@ def run(json_res_dir , tmp_test_dir):
             # todo_list.append(project_name)
     
     for project_index , project_name in enumerate(todo_list):
-        logger.debug(f"Begin processing project {project_name}")
+        logger.info(f"Begin processing project {project_name}")
         
         run_projcet(project_name, json_res_dir, tmp_test_dir)
         
         # with open(done_proj_file, 'a+') as f:
         #     f.write(project_name + '\n')
-        logger.debug(f"Finished project {project_name}\n\n")
-        logger.debug(f"Collect generated suite and overall coverage\n\n")
+        logger.info(f"Finished project {project_name}\n\n")
+        logger.info(f"Collect generated suite and overall coverage\n\n")
 
 
-def record_time(time_dict, date):
-    total_time = 0
-    total_method = 0
+# def record_time(time_dict, date):
+#     total_time = 0
+#     total_method = 0
     
-    for project, package_dict in time_dict.items():
-        for package, method_dict in package_dict.items():
-            for method, time in method_dict.items():
-                total_time += time
-                total_method += 1
+#     for project, package_dict in time_dict.items():
+#         for package, method_dict in package_dict.items():
+#             for method, time in method_dict.items():
+#                 total_time += time
+#                 total_method += 1
     
-    if total_method == 0:
-        logger.debug(f"No method processed, return")
-        return
-    logger.debug(f"Total time elapsed: {total_time}")
-    logger.debug(f"Total method processed: {total_method}")
-    logger.debug(f"Average time elapsed: {total_time / total_method}")
+#     if total_method == 0:
+#         logger.debug(f"No method processed, return")
+#         return
+#     logger.debug(f"Total time elapsed: {total_time}")
+#     logger.debug(f"Total method processed: {total_method}")
+#     logger.debug(f"Average time elapsed: {total_time / total_method}")
     
-    time_dict['total_time'] = total_time
-    time_dict['total_method'] = total_method
-    time_dict['average_time'] = total_time / total_method
+#     time_dict['total_time'] = total_time
+#     time_dict['total_method'] = total_method
+#     time_dict['average_time'] = total_time / total_method
     
-    time_dir = os.path.join(code_base, 'data', 'time')
-    if not os.path.exists(time_dir):
-        os.makedirs(time_dir)
-    time_file = os.path.join(code_base, 'data', 'time', date + '.json')
-    with open(time_file, 'w') as f:
-        json.dump(time_dict, f)
+#     time_dir = os.path.join(code_base, 'data', 'time')
+#     if not os.path.exists(time_dir):
+#         os.makedirs(time_dir)
+#     time_file = os.path.join(code_base, 'data', 'time', date + '.json')
+#     with open(time_file, 'w') as f:
+#         json.dump(time_dict, f)
 
 def generate_entry():
     timestamp = time.time()
@@ -182,7 +192,7 @@ def generate_entry():
     os.makedirs(tmp_test_dir, exist_ok=True)
     
     logger.debug("Generation begins!")    # logger.debug是让logger输出一条debug等级的日志消息
-    run(json_res_dir, tmp_test_dir, debugging_mode=False)
+    run(json_res_dir, tmp_test_dir)
     logger.debug("Generation completed!")
     
     # record_time(time_dict, date)
