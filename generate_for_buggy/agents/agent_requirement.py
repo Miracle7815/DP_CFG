@@ -4,7 +4,7 @@ import os
 import re
 from copy import deepcopy
 from ..config import logger
-from ..basic_class.llm_message import MessageThread , FunctionCall
+from ..basic_class.llm_message import MessageThread , FunctionCall , ContextManager
 from ..models import model
 from .agent_reviewer import ReviewAgent
 
@@ -103,6 +103,38 @@ You should use tools to retrieve the defination of what you need.
 }
 '''  
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_method_source",
+            "description": "Get the source code implementation of the method in a given class. Only call it when you need to know the exact logic or side effects of the method.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "class_name": {"type": "string", "description": "Whole class name where the method is defined refering to import map. (eg: org.apache.commons.lang3.AnnotationUtils)"},
+                    "method_name": {"type": "string", "description": "The exact name of method (eg: isValid)"}
+                },
+                "required": ["class_name", "method_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_class_skeleton",
+            "description": "Retrieve the structural skeleton of a class, including all field declarations and method signatures, but excluding any method bodies or implementation details. Use it to quickly understand the class structure and available APIs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "class_name": {"type": "string", "description": "Whole class name you want to quickly understand. (eg: org.apache.commons.lang3.AnnotationUtils)"}
+                },
+                "required": ["class_name"]
+            }
+        }
+    }
+]
+
 REQUIREMENT_PROMPT = '''*** Write requirement for test ***
 The Target Method you are analyzing belongs to a codebase that is UNKNOWN to contain bugs. 
 Therefore, you must NOT assume the actual code implementation is correct.
@@ -190,17 +222,17 @@ class RequirementAgent:
 
         return results
 
-    def search_method_source(self , class_name , method_name):
-        result = []
+    # def search_method_source(self , class_name , method_name):
+    #     result = []
 
-        for classs_name , classs in self.class_map.items():
-            if classs_name == class_name:
-                for method in classs.methods:
-                    if method.name_no_package == method_name and method in self.target_method.called_methods:
-                        result.append(method)
-                break
+    #     for classs_name , classs in self.class_map.items():
+    #         if classs_name == class_name:
+    #             for method in classs.methods:
+    #                 if method.name_no_package == method_name and method in self.target_method.called_methods:
+    #                     result.append(method)
+    #             break
 
-        return result
+    #     return result
 
     def search_field_defination(self , class_name , field_name):
         for classs_name , classs in self.class_map.items():
@@ -248,6 +280,38 @@ class RequirementAgent:
         
         return results
     
+    def search_method_source(self , class_name , method_name):
+        result = []
+
+        for classs_name , classs in self.class_map.items():
+            if classs_name == class_name:
+                for method in classs.methods:
+                    if method.name_no_package == method_name and method in self.target_method.called_methods:
+                        result.append(method)
+                break
+
+        return result
+    
+    def search_class_skeleton(self , class_name):
+        skeleton_str = ""
+        for classs_name , classs in self.class_map.items():
+            if classs_name == class_name:
+                skeleton_str += classs.signature + "\n"
+                skeleton_str += '   -Fields:\n'
+                for class_field , statement in classs.fields.items():
+                    skeleton_str += f"      {statement}\n"
+                skeleton_str += '   -Constructors:\n'
+                for constructor in classs.constructor:
+                    skeleton_str += f"      {constructor.signature}\n"
+                skeleton_str += '   -Methods:\n'
+                for method in classs.methods:
+                    skeleton_str += f"      {method.signature}\n"
+            break
+        
+        if skeleton_str == "":
+            skeleton_str = "Class not found"
+        return skeleton_str
+                
 
     def write_requirement_for_method(self , target_method):
         logger.info("--------- Stage 1: Context gathering ---------")
@@ -257,31 +321,35 @@ class RequirementAgent:
         # thread.add_system(SYSTEM_PROMPT)
         context_thread.add_system(CONTEXT_SYSTEM_PROMPT + '\n' + TOOL_PROMPT)
 
-        user_prompt = None
-        prefix_prompt = '''Here is the target method under test:\n'''
-        
         javadoc = target_method.javadoc if target_method.javadoc is not None else "No Java doc" 
         import_string = ""
         for import_info in target_method.import_map.values():
             import_string += import_info + "\n"
         
         import_string = import_string if import_string != "" else "No import information"
-
-        call_methods_string = ""
-        for called_method in self.target_method.called_methods:
-            call_methods_string += f"{called_method.signature}\n"
-
-        call_methods_string = call_methods_string if call_methods_string != "" else "No called methods"
-
-        method_info = TARGET_METHOD_INFO.format(class_name=target_method.belong_class , import_list=import_string , method_signature=target_method.signature , javadoc=javadoc  , source_code=target_method.content , call_methods=call_methods_string)
         
-        user_prompt = prefix_prompt + method_info
+        contextManager = ContextManager(target_method.belong_class , target_method.name , target_method.content , import_string , target_method.signature , javadoc=javadoc)
+
+        user_prompt = None
+        prefix_prompt = '''Here is the target method under test:\n'''
+        
+        # call_methods_string = ""
+        # for called_method in self.target_method.called_methods:
+        #     call_methods_string += f"{called_method.signature}\n"
+
+        # call_methods_string = call_methods_string if call_methods_string != "" else "No called methods"
+
+        # method_info = TARGET_METHOD_INFO.format(class_name=target_method.belong_class , import_list=import_string , method_signature=target_method.signature , javadoc=javadoc  , source_code=target_method.content , call_methods=call_methods_string)
+        
+        # user_prompt = prefix_prompt + method_info
+        user_prompt = prefix_prompt + contextManager.format_for_prompt()
+
         context_thread.add_user(user_prompt)
-        requirement_thread.add_user("Here is the information about method under test\n" + method_info)
+        # requirement_thread.add_user("Here is the information about method under test\n" + method_info)
         
         logger.info(f"Requirement Prompt: \n{context_thread.to_msg()}")
 
-        response , *_ = model.SELECTED_MODEL.call(context_thread.to_msg())
+        response , tool_calls , *_ = model.SELECTED_MODEL.call(context_thread.to_msg() , TOOLS)
         
         logger.info(f"Requirement Agent response:\n{response}")
 
@@ -298,110 +366,127 @@ class RequirementAgent:
                 flag = True
                 break
 
-            results = self.analyse_tool_calls(response)  
-            if results is not []:
-                function_calls = []
-                tool_calls = results[0]['tool_calls']
-                for tool_call in tool_calls:
-                    function_name = tool_call['tool_name'].strip()
-                    arguments = tool_call['args']
-                    function_call = FunctionCall(tool_id , function_name , arguments)
-                    tool_id += 1
-
-                    function_calls.append(function_call)
-                
-                # thread.add_model(None , function_calls)
-                # thread.add_model(response)
-                
-                call_results = {"tool_calls": []}
-                for function_call in function_calls:
-                     
-                    if function_call.function_name == "search_method_source":
-                        try:
-                            class_name = function_call.arguments['class_name']
-                            method_name = function_call.arguments['method_name']
-                            function_result = self.search_method_source(class_name , method_name)
-                            if len(function_result) != 0:
-                                function_call.set_result(function_result , True)
-                            else:
-                                function_call.set_result("Method not found" , True)
-                        except Exception as e:
-                            function_call.set_result(str(e) , False)
-                    elif function_call.function_name == "search_field_defination":
-                        try:
-                            class_name = function_call.arguments['class_name']
-                            field_name = function_call.arguments['field_name']
-                            function_result = self.search_field_defination(class_name , field_name)
-                            if function_result is not None:
-                                function_call.set_result(function_result , True)
-                            else:
-                                function_call.set_result("Field not found" , True)
-                        except Exception as e:
-                            function_call.set_result(str(e) , False)
-                    elif function_call.function_name == "search_use_example":
-                        try:
-                            function_result = self.search_use_example()
-                            if function_result != []:
-                                function_result_string = ""
-                                for i , result in enumerate(function_result):
-                                    function_result_string += f"Example {i + 1}:\n{result}\n"
-                                function_call.set_result(function_result_string , True)
-                            else:
-                                function_call.set_result("No use example" , True)
-                        except Exception as e:
-                            function_call.set_result(str(e) , False)
+            results = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                tool_call_id = tool_call.id
+                args = json.load(tool_call.function.arguments)
+                if tool_name == 'search_method_source':
+                    result = self.search_method_source(args.get('class_name') , args.get('method_name'))
+                    if len(result) == 0:
+                        results.append('Method not found')
                     else:
-                        function_call.set_result("Tool not found" , False)
+                        results.append(result)
+                elif tool_name == 'search_class_skeleton':
+                    result = self.search_class_skeleton(args.get('class_name'))
+                    results.append(result)
 
-                    call_results["tool_calls"].append(function_call)
-
-                # thread.add_user(json.dumps(call_results , ensure_ascii=False) + "\n" + TOOL_PROMPT)
-                # thread.add_user(json.dumps(call_results , ensure_ascii=False))
-                call_results_content = "Here is the context information you need:\n**Context information**\n"
                 
-                for call_result in call_results['tool_calls']:
-                    if call_result.call_ok is False:
-                        continue
-                    if call_result not in self.context_request_memory:
-                        self.context_request_memory.append(call_result)
 
-                # for call_result in call_results["tool_calls"]:
-                #     flag = True
-                #     if str(call_result) not in function_list:
-                #         function_list.append(str(call_result))
-                #         flag = False
+            # results = self.analyse_tool_calls(response)  
+            # if results is not []:
+            #     function_calls = []
+            #     tool_calls = results[0]['tool_calls']
+            #     for tool_call in tool_calls:
+            #         function_name = tool_call['tool_name'].strip()
+            #         arguments = tool_call['args']
+            #         function_call = FunctionCall(tool_id , function_name , arguments)
+            #         tool_id += 1
 
-                #     content_string = ''
-                #     if call_result.function_name == "search_use_example":
-                #         content_string += "## " + self.target_method.name + " Usage example:\n"
-                #         content_string += call_result.result + "\n"
-                #         call_results_content += content_string
-                #     else:
-                #         content_string += f"## {call_result.parameters_to_str()} :\n{call_result.result}\n"
-                #         call_results_content += content_string
-
-                #     if flag is False:
-                #         function_string.append(content_string)
-
-                # context_thread.add_user(call_results_content)
-            context_thread.pop_message()
+            #         function_calls.append(function_call)
                 
-            new_prompt = "\nHere is the context information you have gathered:\n"
-            context_string = ""
-            for tool_call in self.context_request_memory:
-                if tool_call.function_name == "search_use_example":
-                    context_string += "## " + self.target_method.name + " Usage example:\n" + tool_call.result + '\n'
-                else:
-                    if tool_call.result == "Method not found" or tool_call.result == "Field not found":
-                        context_string += "## " + tool_call.arguments[0] + '.' + tool_call.arguments[1] + " : " + tool_call.result + "\n"
-                    elif tool_call.function_name == "search_field_defination":
-                        context_string += "## " + tool_call.arguments[0] + '.' + tool_call.arguments[1] + " : " + tool_call.result + "\n"
-                    elif tool_call.function_name == "search_method_source":
-                        for method in tool_call.result:
-                            context_string += "## " + method.signature + " :\n" + method.content + "\n"
+            #     # thread.add_model(None , function_calls)
+            #     # thread.add_model(response)
+                
+            #     call_results = {"tool_calls": []}
+            #     for function_call in function_calls:
+                     
+            #         if function_call.function_name == "search_method_source":
+            #             try:
+            #                 class_name = function_call.arguments['class_name']
+            #                 method_name = function_call.arguments['method_name']
+            #                 function_result = self.search_method_source(class_name , method_name)
+            #                 if len(function_result) != 0:
+            #                     function_call.set_result(function_result , True)
+            #                 else:
+            #                     function_call.set_result("Method not found" , True)
+            #             except Exception as e:
+            #                 function_call.set_result(str(e) , False)
+            #         elif function_call.function_name == "search_field_defination":
+            #             try:
+            #                 class_name = function_call.arguments['class_name']
+            #                 field_name = function_call.arguments['field_name']
+            #                 function_result = self.search_field_defination(class_name , field_name)
+            #                 if function_result is not None:
+            #                     function_call.set_result(function_result , True)
+            #                 else:
+            #                     function_call.set_result("Field not found" , True)
+            #             except Exception as e:
+            #                 function_call.set_result(str(e) , False)
+            #         elif function_call.function_name == "search_use_example":
+            #             try:
+            #                 function_result = self.search_use_example()
+            #                 if function_result != []:
+            #                     function_result_string = ""
+            #                     for i , result in enumerate(function_result):
+            #                         function_result_string += f"Example {i + 1}:\n{result}\n"
+            #                     function_call.set_result(function_result_string , True)
+            #                 else:
+            #                     function_call.set_result("No use example" , True)
+            #             except Exception as e:
+            #                 function_call.set_result(str(e) , False)
+            #         else:
+            #             function_call.set_result("Tool not found" , False)
 
-            new_prompt = method_info + new_prompt + context_string
-            context_thread.add_user(new_prompt)
+            #         call_results["tool_calls"].append(function_call)
+
+            #     # thread.add_user(json.dumps(call_results , ensure_ascii=False) + "\n" + TOOL_PROMPT)
+            #     # thread.add_user(json.dumps(call_results , ensure_ascii=False))
+            #     call_results_content = "Here is the context information you need:\n**Context information**\n"
+                
+            #     for call_result in call_results['tool_calls']:
+            #         if call_result.call_ok is False:
+            #             continue
+            #         if call_result not in self.context_request_memory:
+            #             self.context_request_memory.append(call_result)
+
+            #     # for call_result in call_results["tool_calls"]:
+            #     #     flag = True
+            #     #     if str(call_result) not in function_list:
+            #     #         function_list.append(str(call_result))
+            #     #         flag = False
+
+            #     #     content_string = ''
+            #     #     if call_result.function_name == "search_use_example":
+            #     #         content_string += "## " + self.target_method.name + " Usage example:\n"
+            #     #         content_string += call_result.result + "\n"
+            #     #         call_results_content += content_string
+            #     #     else:
+            #     #         content_string += f"## {call_result.parameters_to_str()} :\n{call_result.result}\n"
+            #     #         call_results_content += content_string
+
+            #     #     if flag is False:
+            #     #         function_string.append(content_string)
+
+            #     # context_thread.add_user(call_results_content)
+            # context_thread.pop_message()
+                
+            # new_prompt = "\nHere is the context information you have gathered:\n"
+            # context_string = ""
+            # for tool_call in self.context_request_memory:
+            #     if tool_call.function_name == "search_use_example":
+            #         context_string += "## " + self.target_method.name + " Usage example:\n" + tool_call.result + '\n'
+            #     else:
+            #         if tool_call.result == "Method not found" or tool_call.result == "Field not found":
+            #             context_string += "## " + tool_call.arguments[0] + '.' + tool_call.arguments[1] + " : " + tool_call.result + "\n"
+            #         elif tool_call.function_name == "search_field_defination":
+            #             context_string += "## " + tool_call.arguments[0] + '.' + tool_call.arguments[1] + " : " + tool_call.result + "\n"
+            #         elif tool_call.function_name == "search_method_source":
+            #             for method in tool_call.result:
+            #                 context_string += "## " + method.signature + " :\n" + method.content + "\n"
+
+            # new_prompt = method_info + new_prompt + context_string
+            # context_thread.add_user(new_prompt)
 
             logger.info(f"Requirement Prompt: \n{context_thread.to_msg()}")
             response , *_ = model.SELECTED_MODEL.call(context_thread.to_msg())

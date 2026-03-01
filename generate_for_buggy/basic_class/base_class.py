@@ -5,6 +5,8 @@ class Class():
         self.name = name # full name
         self.name_no_package = name_no_package # name without package
 
+        self.signature = None
+
         self.is_enum = False
         self.is_interface = False
         

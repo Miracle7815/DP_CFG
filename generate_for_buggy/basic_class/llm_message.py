@@ -30,8 +30,8 @@ class MessageThread:
     #     m = {"role": "tool", "content": message, "tool_call_id": tool_call_id}
     #     self.messages.append(m)
 
-    def add_tool(self, message: str):
-        self.messages.append({"role": "tool", "content": message})
+    def add_tool(self, message: str , tool_call_id):
+        self.messages.append({"role": "tool", "tool_call_id" : tool_call_id , "content": message})
 
     def clean_thread(self):
         self.messages = []    
@@ -182,3 +182,43 @@ class FunctionCall:
             "call_ok": self.call_ok
         }
 
+class ContextManager:
+    def __init__(self, target_class, target_method, target_code , import_list , method_signature , javadoc):
+        self.target_class = target_class
+        self.target_method = target_method
+        self.target_code = target_code 
+        self.import_list = import_list
+        self.method_signature = method_signature
+        self.javadoc = javadoc
+
+        # context
+        self.collected_methods = {}   # key: "ClassName.methodName", value: code
+        self.collected_skeletons = {} # key: "ClassName", value: skeleton_code
+        
+    def format_for_prompt(self):
+        """convert to xml format"""
+        context_str = f"<target_method class=\"{self.target_class}\" name=\"{self.target_method}\">\n{self.target_code}\n</target_method>\n\n"
+        
+        if self.collected_methods or self.collected_skeletons:
+            context_str += "Here is the collected context for target method:\n"
+            if self.collected_methods:
+                context_str += "<collected_methods>\n"
+                for name, code in self.collected_methods.items():
+                    context_str += f"  <method_implementation name=\"{name}\">\n{code}\n  </method_implementation>\n"
+                context_str += "</collected_methods>\n\n"
+                
+            if self.collected_skeletons:
+                context_str += "<class_skeletons>\n"
+                for name, skeleton in self.collected_skeletons.items():
+                    context_str += f"  <skeleton name=\"{name}\">\n{skeleton}\n  </skeleton>\n"
+                context_str += "</class_skeletons>\n"
+            
+        return context_str
+    
+    def update_collected_methods(self , method_name , code):
+        if method_name not in self.collected_methods.keys():
+            self.collected_methods[method_name] = code
+    
+    def update_collected_skeletons(self , class_name , skeleton_code):
+        if class_name not in self.collected_skeletons.keys():
+            self.collected_skeletons[class_name] = skeleton_code

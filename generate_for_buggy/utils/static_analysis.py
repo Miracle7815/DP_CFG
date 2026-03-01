@@ -46,12 +46,20 @@ def find_classes(node , package , out_class_name , class_queue , single_file):
         class_name = class_name_node.text.decode()
         class_content = node.text.decode()
 
+        source_bytes =  single_file.content.encode("utf-8")
+        class_signature = source_bytes[
+            node.start_byte :
+            node.child_by_field_name("body").start_byte
+        ].decode("utf-8")
+
         if out_class_name != None:
             # inner class 
             class_name = f"{out_class_name}.{class_name}"
         
         # (name , belong_package , name_no_package , content , node)
         new_class = Class(f"{package.name}.{class_name}" , package , class_name , class_content , node)
+        new_class.signature = class_signature
+        
         if node.type == 'enum_declaration':
             new_class.is_enum = True
         if node.type == 'interface_declaration':

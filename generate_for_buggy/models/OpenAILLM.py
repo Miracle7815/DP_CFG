@@ -45,7 +45,7 @@ class OpenaiModel(model.Model):
         )
 
 
-    def call(self , messages , retry=3 , temperature = 0.0):
+    def call(self , messages , tools=None , retry=3 , temperature = 0.0):
         if self.client is None:
             return None
         
@@ -53,12 +53,22 @@ class OpenaiModel(model.Model):
 
         for try_num in range(retry):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=temperature,
-                    stream=False    
-                )
+                if tools is None:
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        temperature=temperature,
+                        stream=False    
+                    )
+                else:
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice='auto',
+                        temperature=temperature,
+                        stream=False    
+                    )
 
                 usage_stats = response.usage
 
@@ -66,15 +76,22 @@ class OpenaiModel(model.Model):
                 output_tokens = int(usage_stats.completion_tokens)
 
                 model.thread_cost.process_input_tokens += input_tokens
-                model.thread_cost.process_output_tokens += output_tokens
+                model.thread_cost.process_output_tokens += output_tokens    
 
-                response_content = response.choices[0].message.content
+                llm_message = response.choices[0].message
+
+                response_content = llm_message.content
                 if response_content is None:
                     response_content = ""
 
+                tool_calls = []
+                if llm_message.tool_calls: 
+                    for tool_call in llm_message.tool_calls:
+                        tool_calls.append(tool_call)
+
                 reason = response.choices[0].finish_reason
 
-                return response_content , input_tokens , output_tokens , reason
+                return response_content , tool_calls , input_tokens , output_tokens , reason
             except Exception as e:
                 logger.debug(f"Invoking LLM error !!!\nmessage:\n{e}")
                 delay = base_delay * (2 ** try_num) + random.uniform(0, 1)  # 退避策略
