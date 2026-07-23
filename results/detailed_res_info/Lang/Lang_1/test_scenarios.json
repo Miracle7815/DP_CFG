@@ -1,0 +1,108 @@
+{
+    "method_intent": "Convert a string representation of a number into a corresponding java.lang.Number type.",
+    "input_output_spec": {
+        "parameter": {
+            "name": "str",
+            "type": "String",
+            "nullable": true,
+            "description": "String containing a numeric value or null."
+        },
+        "return": {
+            "type": "Number",
+            "nullable": true,
+            "description": "A Number object representing the value of the input string, or null if the input is null."
+        }
+    },
+    "test_scenarios": [
+        {
+            "id": "S1",
+            "category": "normal_path",
+            "description": "Test conversion of a valid integer string to Integer.",
+            "input_constraints": "Input is a non-null string representing a valid integer.",
+            "expected_behavior_constraints": "Returns an Integer object representing the value of the input string.",
+            "rationale": "Covers the normal behavior of converting a valid integer string.",
+            "priority": "high"
+        },
+        {
+            "id": "S2",
+            "category": "normal_path",
+            "description": "Test conversion of a valid floating-point string to Float.",
+            "input_constraints": "Input is a non-null string representing a valid floating-point number.",
+            "expected_behavior_constraints": "Returns a Float object representing the value of the input string.",
+            "rationale": "Covers the normal behavior of converting a valid floating-point string.",
+            "priority": "high"
+        },
+        {
+            "id": "S3",
+            "category": "normal_path",
+            "description": "Test conversion of a valid hexadecimal string to BigInteger.",
+            "input_constraints": "Input is a non-null string starting with '0x' or '#', followed by valid hexadecimal digits.",
+            "expected_behavior_constraints": "Returns a BigInteger object representing the hexadecimal value of the input string.",
+            "rationale": "Covers the normal behavior of converting a valid hexadecimal string.",
+            "priority": "high"
+        },
+        {
+            "id": "S4",
+            "category": "boundary",
+            "description": "Test conversion of a null input string.",
+            "input_constraints": "Input is null.",
+            "expected_behavior_constraints": "Returns null.",
+            "rationale": "Covers the boundary case where the input is null.",
+            "priority": "high"
+        },
+        {
+            "id": "S5",
+            "category": "boundary",
+            "description": "Test conversion of an empty string.",
+            "input_constraints": "Input is a non-null empty string.",
+            "expected_behavior_constraints": "Throws NumberFormatException.",
+            "rationale": "Covers the boundary case where the input is an empty string.",
+            "priority": "high"
+        },
+        {
+            "id": "S6",
+            "category": "suspicious",
+            "description": "Test conversion of a string with leading or trailing spaces.",
+            "input_constraints": "Input is a non-null string with leading or trailing spaces.",
+            "expected_behavior_constraints": "Throws NumberFormatException.",
+            "rationale": "Tests the behavior with leading/trailing spaces which is not explicitly documented.",
+            "priority": "medium"
+        },
+        {
+            "id": "S7",
+            "category": "edge_case",
+            "description": "Test conversion of a valid octal string.",
+            "input_constraints": "Input is a non-null string representing a valid octal number (starts with '0').",
+            "expected_behavior_constraints": "Returns an Integer, Long, or BigDecimal object depending on the value of the octal string.",
+            "rationale": "Covers the edge case of interpreting octal values.",
+            "priority": "medium"
+        },
+        {
+            "id": "S8",
+            "category": "edge_case",
+            "description": "Test conversion of a very large number string that exceeds Long range.",
+            "input_constraints": "Input is a non-null string representing a number larger than Long.MAX_VALUE.",
+            "expected_behavior_constraints": "Returns a BigInteger object representing the value of the input string.",
+            "rationale": "Covers the edge case of handling very large numbers.",
+            "priority": "medium"
+        },
+        {
+            "id": "S9",
+            "category": "suspicious",
+            "description": "Test conversion of a non-null string containing invalid numeric characters.",
+            "input_constraints": "Input is a non-null string containing characters that are not valid numeric characters.",
+            "expected_behavior_constraints": "Throws NumberFormatException.",
+            "rationale": "Addresses the missing coverage for invalid numeric strings as per reviewer feedback.",
+            "priority": "high"
+        },
+        {
+            "id": "S10",
+            "category": "suspicious",
+            "description": "Test conversion of a string consisting solely of whitespace characters.",
+            "input_constraints": "Input is a non-null string that contains only whitespace characters.",
+            "expected_behavior_constraints": "Throws NumberFormatException.",
+            "rationale": "Addresses the missing coverage for strings with only whitespace as per reviewer feedback.",
+            "priority": "high"
+        }
+    ]
+}

@@ -172,7 +172,7 @@ def get_packages(project_path , src_path):
             arguments_list = tuple(method.parameters_list)
             method_map[(name, arguments_list)]= method
 
-    # cfg dfg
+    # cfg 
     # for sigle_file in all_files:
     
     for single_file in all_files:

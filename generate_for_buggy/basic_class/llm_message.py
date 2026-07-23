@@ -183,42 +183,114 @@ class FunctionCall:
         }
 
 class ContextManager:
-    def __init__(self, target_class, target_method, target_code , import_list , method_signature , javadoc):
+    def __init__(self, target_class, target_method, import_list, method_signature, javadoc):
         self.target_class = target_class
         self.target_method = target_method
-        self.target_code = target_code 
         self.import_list = import_list
         self.method_signature = method_signature
         self.javadoc = javadoc
 
-        # context
-        self.collected_methods = {}   # key: "ClassName.methodName", value: code
-        self.collected_skeletons = {} # key: "ClassName", value: skeleton_code
-        
+        # Collected context - stores FULL code/details (NOT shown to model during collection)
+        self.collected_methods = {}       # key: "ClassName.methodName", value: signature + javadoc (from search_method_contract)
+        self.collected_called_methods = []  # list of signature strings (from search_called_methods)
+        self.collected_skeletons = {}     # key: "ClassName", value: full skeleton code
+        self.collected_fields = {}        # key: "ClassName.fieldName", value: field definition
+        self.collected_examples = []      # list of usage example strings
+
     def format_for_prompt(self):
-        """convert to xml format"""
-        context_str = f"<target_method class=\"{self.target_class}\" name=\"{self.target_method}\">\n{self.target_code}\n</target_method>\n\n"
-        
-        if self.collected_methods or self.collected_skeletons:
-            context_str += "Here is the collected context for target method:\n"
+        """Convert to XML format — only collected context (no target_method info, already in prompt)."""
+        context_str = ""
+
+        if self.collected_methods or self.collected_called_methods or self.collected_skeletons or self.collected_fields or self.collected_examples:
+            context_str += "Collected context:\n"
+
             if self.collected_methods:
                 context_str += "<collected_methods>\n"
                 for name, code in self.collected_methods.items():
                     context_str += f"  <method_implementation name=\"{name}\">\n{code}\n  </method_implementation>\n"
                 context_str += "</collected_methods>\n\n"
-                
+
+            if self.collected_called_methods:
+                context_str += "<called_methods>\n"
+                for sig in self.collected_called_methods:
+                    context_str += f"  <called_method>{sig}</called_method>\n"
+                context_str += "</called_methods>\n\n"
+
             if self.collected_skeletons:
                 context_str += "<class_skeletons>\n"
                 for name, skeleton in self.collected_skeletons.items():
                     context_str += f"  <skeleton name=\"{name}\">\n{skeleton}\n  </skeleton>\n"
-                context_str += "</class_skeletons>\n"
-            
+                context_str += "</class_skeletons>\n\n"
+
+            if self.collected_fields:
+                context_str += "<collected_fields>\n"
+                for name, definition in self.collected_fields.items():
+                    context_str += f"  <field name=\"{name}\">\n{definition}\n  </field>\n"
+                context_str += "</collected_fields>\n\n"
+
+            if self.collected_examples:
+                context_str += "<use_examples>\n"
+                for i, example in enumerate(self.collected_examples):
+                    context_str += f"  <example id=\"{i+1}\">\n{example}\n  </example>\n"
+                context_str += "</use_examples>\n"
+        
+        if context_str is '':
+            context_str = "No collected Context"
+
         return context_str
-    
-    def update_collected_methods(self , method_name , code):
+
+    def format_summary_for_model(self):
+        """Provide a SUMMARY of collected context — NOT the full code.
+        Used during ReAct context collection to give the model awareness
+        of what has been collected without flooding it with source code.
+        """
+        summary_lines = []
+
+        if self.collected_methods:
+            summary_lines.append("Collected method implementations:")
+            for name in self.collected_methods:
+                summary_lines.append(f"  - {name} (source code collected)")
+
+        if self.collected_called_methods:
+            summary_lines.append("Collected called methods:")
+            for sig in self.collected_called_methods:
+                summary_lines.append(f"  - {sig} (signature collected)")
+
+        if self.collected_skeletons:
+            summary_lines.append("Collected class skeletons:")
+            for name in self.collected_skeletons:
+                summary_lines.append(f"  - {name} (structure collected)")
+
+        if self.collected_fields:
+            summary_lines.append("Collected field definitions:")
+            for name in self.collected_fields:
+                summary_lines.append(f"  - {name} (definition collected)")
+
+        if self.collected_examples:
+            summary_lines.append(f"Collected {len(self.collected_examples)} usage example(s)")
+
+        if not summary_lines:
+            return "No context collected yet."
+
+        return "\n".join(summary_lines)
+
+    def update_collected_methods(self, method_name, code):
         if method_name not in self.collected_methods.keys():
             self.collected_methods[method_name] = code
-    
-    def update_collected_skeletons(self , class_name , skeleton_code):
+
+    def update_collected_called_methods(self, signature):
+        if signature not in self.collected_called_methods:
+            self.collected_called_methods.append(signature)
+
+    def update_collected_skeletons(self, class_name, skeleton_code):
         if class_name not in self.collected_skeletons.keys():
             self.collected_skeletons[class_name] = skeleton_code
+
+    def update_collected_fields(self, class_name, field_name, definition):
+        key = f"{class_name}.{field_name}"
+        if key not in self.collected_fields:
+            self.collected_fields[key] = definition
+
+    def update_collected_examples(self, example):
+        if example not in self.collected_examples:
+            self.collected_examples.append(example)

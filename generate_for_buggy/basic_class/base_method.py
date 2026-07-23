@@ -62,7 +62,7 @@ class Method():
 
         # coverage info
         self.missed_lines = set()
-        self.missed_brachese = set()
+        self.missed_braches = set()
 
         # cfg
         # self.declaration_value = None

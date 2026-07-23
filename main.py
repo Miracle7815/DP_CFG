@@ -60,6 +60,6 @@ BASE_URL = "https://api.openai-proxy.org/v1"
 API_KEY = "sk-YXeIf5Hzq452SluTP77QPGWOeWHq7GFMqH4C4kwr9uFZhbhv"
 
 review_model = OpenaiModel(review_model_name)
-set_review_model(review_model)
+set_review_model(review_model , API_KEY , BASE_URL)
 
 generate_entry()
