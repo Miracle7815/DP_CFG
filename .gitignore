@@ -24,3 +24,7 @@ build/
 /venv/
 /env/
 /ENV/
+
+# Private documentation (only the public root README is committed)
+*.md
+!/README.md
