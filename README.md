@@ -31,5 +31,3 @@ python main.py
 ```powershell
 python -m pytest -q
 ```
-
-本地数据、运行结果、环境文件和内部文档均由 `.gitignore` 排除。
