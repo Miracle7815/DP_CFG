@@ -33,6 +33,9 @@ class MessageThread:
     def add_tool(self, message: str , tool_call_id):
         self.messages.append({"role": "tool", "tool_call_id" : tool_call_id , "content": message})
 
+    def add_tool_result(self, tool_call_id: str, message: str):
+        self.add_tool(message, tool_call_id)
+
     def clean_thread(self):
         self.messages = []    
     
@@ -44,42 +47,34 @@ class MessageThread:
 
         return None
 
-    def add_model(
-        self, message: str | None, tools = []
-    ):
-        # let's serialize tools into json first
+    def add_model(self, message: str | None, tools=None):
+        tools = tools or []
         json_tools = []
-        for i , tool in enumerate(tools):
-            this_tool_dict = {}
-            this_tool_dict["id"] = tool.tool_id
-            # this_tool_dict["type"] = tool.type
-            # now serialize function as well
-            # func_obj = tool.function
-            # func_args: str = func_obj.arguments
-            # func_name: str = func_obj.name
+        for tool in tools:
+            if hasattr(tool, "function"):
+                json_tools.append({
+                    "id": tool.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool.function.name,
+                        "arguments": tool.function.arguments,
+                    },
+                })
+            else:
+                json_tools.append({
+                    "id": tool.tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool.function_name,
+                        "arguments": json.dumps(tool.arguments),
+                    },
+                })
 
-            func_args: str = tool.arguments
-            func_name: str = tool.function_name
-
-            this_tool_dict["function"] = {"name": func_name, "arguments": func_args}
-            json_tools.append(this_tool_dict)
-
-        # if json_tools == []:
-        #     # there is no tool calls from the model last time,
-        #     # the best we could do is to return the generated text
-        #     self.messages.append({"role": "assistant", "content": message})
-        # else:
-        #     self.messages.append(
-        #         {"role": "assistant", "content": None, "tool_calls": json_tools}
-        #     )
-
-        if json_tools == []:
-            # there is no tool calls from the model last time,
-            # the best we could do is to return the generated text
+        if not json_tools:
             self.messages.append({"role": "assistant", "content": message})
         else:
             self.messages.append(
-                {"role": "assistant", "content": json_tools}
+                {"role": "assistant", "content": message, "tool_calls": json_tools}
             )
 
     def to_msg(self) -> list[dict]:
@@ -190,7 +185,7 @@ class ContextManager:
         self.method_signature = method_signature
         self.javadoc = javadoc
 
-        # Collected context - stores FULL code/details (NOT shown to model during collection)
+        # Collected context contains only source-free public contracts and skeletons.
         self.collected_methods = {}       # key: "ClassName.methodName", value: signature + javadoc (from search_method_contract)
         self.collected_called_methods = []  # list of signature strings (from search_called_methods)
         self.collected_skeletons = {}     # key: "ClassName", value: full skeleton code
@@ -207,7 +202,7 @@ class ContextManager:
             if self.collected_methods:
                 context_str += "<collected_methods>\n"
                 for name, code in self.collected_methods.items():
-                    context_str += f"  <method_implementation name=\"{name}\">\n{code}\n  </method_implementation>\n"
+                    context_str += f"  <method_contract name=\"{name}\">\n{code}\n  </method_contract>\n"
                 context_str += "</collected_methods>\n\n"
 
             if self.collected_called_methods:
@@ -234,7 +229,7 @@ class ContextManager:
                     context_str += f"  <example id=\"{i+1}\">\n{example}\n  </example>\n"
                 context_str += "</use_examples>\n"
         
-        if context_str is '':
+        if context_str == '':
             context_str = "No collected Context"
 
         return context_str
@@ -247,9 +242,9 @@ class ContextManager:
         summary_lines = []
 
         if self.collected_methods:
-            summary_lines.append("Collected method implementations:")
+            summary_lines.append("Collected method contracts:")
             for name in self.collected_methods:
-                summary_lines.append(f"  - {name} (source code collected)")
+                summary_lines.append(f"  - {name} (signature and documentation collected)")
 
         if self.collected_called_methods:
             summary_lines.append("Collected called methods:")

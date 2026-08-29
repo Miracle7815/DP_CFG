@@ -1,7 +1,11 @@
-import os
 import json
+import os
+import re
 
-DATA_INFO_PATH = "/home/miracle/DP_CFG/data_info"
+from ..config import CONFIG
+
+
+DATA_INFO_PATH = CONFIG["data_info_path"]
 
 def get_method_info(project_name):
     project_group = project_name.split('_')[0]
@@ -37,6 +41,48 @@ def process_method_info(project_name , project_root):
 
     return class_method_map
 
+def _split_parameters(parameters: str) -> list[str]:
+    parameters = parameters.strip()
+    if not parameters:
+        return []
+
+    parts = []
+    current = []
+    depth = 0
+    for char in parameters:
+        if char in "<([":
+            depth += 1
+        elif char in ">)]":
+            depth = max(0, depth - 1)
+        if char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _normalise_declared_type(parameter: str) -> str:
+    parameter = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", parameter).strip()
+    parameter = re.sub(r"\b(final|volatile|transient)\b\s*", "", parameter).strip()
+    tokens = parameter.split()
+    if len(tokens) > 1:
+        parameter = " ".join(tokens[:-1])
+    return re.sub(r"\s+", "", parameter).replace("...", "[]")
+
+
+def _types_match(expected: str, actual: str) -> bool:
+    expected = _normalise_declared_type(expected)
+    actual = _normalise_declared_type(actual)
+    if expected == actual:
+        return True
+    if "." not in expected:
+        return expected == actual.rsplit(".", 1)[-1]
+    return False
+
+
 def get_callable_method(all_packages , class_name , method_info):
     package_name = ".".join(class_name.split('.')[:-1])
     target_package = None
@@ -57,13 +103,22 @@ def get_callable_method(all_packages , class_name , method_info):
     if target_class is None:
         return None
 
-    target_method = None
+    expected_parameters = _split_parameters(method_info[1])
+    candidates = []
     for method in target_class.methods:
-        # if method.name_no_package == "createNumber":
-        #     pass
-        if method.name_no_package == method_info[0]:
-            if all(method_parameter.strip() in method.parameters_string for method_parameter in method_info[1].split(',')) and method_info[2].strip() in method.return_type:
-                target_method = method
-                break
-    
-    return target_method
+        if method.name_no_package != method_info[0]:
+            continue
+        if len(method.parameters_list) != len(expected_parameters):
+            continue
+        if not all(
+            _types_match(expected, actual)
+            for expected, actual in zip(expected_parameters, method.parameters_list)
+        ):
+            continue
+        if not _types_match(method_info[2], method.return_type):
+            continue
+        candidates.append(method)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return None

@@ -1,102 +1,65 @@
-from openai import OpenAI
-import sys
-from ..config import logger
-from tenacity import retry, stop_after_attempt, wait_random_exponential
-from . import model
 import random
 import time
 
+from openai import OpenAI
+
+from ..config import logger
+from . import model
+
+
 class OpenaiModel(model.Model):
-    _instances = {}
-    
-    def __new__(cls , *args):         
-        if cls not in cls._instances:
-            cls._instances[cls] = super().__new__(cls)
-            cls._instances[cls]._initialized = False
-        return cls._instances[cls]
-
     def __init__(
-            self,
-            model_name: str,
-            time_out: int = 100,
-            parallel_tool_call: bool = False,
-        ):
-            
-        super().__init__(model_name , time_out , parallel_tool_call)
-
-        self.api_key = None
-        self.base_url = None
-        
+        self,
+        model_name: str,
+        time_out: int = 100,
+        parallel_tool_call: bool = False,
+    ):
+        super().__init__(model_name, time_out, parallel_tool_call)
         self.client = None
 
-    def setup(self , api_key , base_url):
-        if api_key is not None:
-            self.api_key = api_key
-        else:
-            logger.debug("Please set valid api key !!")
-            sys.exit(1)
-        
+    def setup(self, api_key: str, base_url: str | None) -> None:
+        if not api_key:
+            raise ValueError(f"Missing API key for model {self.model_name}")
+        self.api_key = api_key
         self.base_url = base_url
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
 
-        self.client = OpenAI(
-            api_key = api_key,
-            base_url = base_url,
-            timeout = self.timeout
-        )
-
-
-    def call(self , messages , tools=None , retry=3 , temperature = 0.0):
+    def call(self, messages, tools=None, retry=3, temperature=0.0) -> model.ModelResponse:
         if self.client is None:
-            return None
-        
-        base_delay = 2
+            raise RuntimeError(f"Model {self.model_name} is not configured")
 
+        base_delay = 2
         for try_num in range(retry):
             try:
-                if tools is None:
-                    response = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=messages,
-                        temperature=temperature,
-                        stream=False    
-                    )
-                else:
-                    response = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice='auto',
-                        temperature=temperature,
-                        stream=False    
-                    )
+                request = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "stream": False,
+                }
+                if tools is not None:
+                    request.update({"tools": tools, "tool_choice": "auto"})
+                response = self.client.chat.completions.create(**request)
 
-                usage_stats = response.usage
-
-                input_tokens = int(usage_stats.prompt_tokens)
-                output_tokens = int(usage_stats.completion_tokens)
-
+                usage = response.usage
+                input_tokens = int(usage.prompt_tokens or 0)
+                output_tokens = int(usage.completion_tokens or 0)
+                model._ensure_thread_cost()
                 model.thread_cost.process_input_tokens += input_tokens
-                model.thread_cost.process_output_tokens += output_tokens    
+                model.thread_cost.process_output_tokens += output_tokens
 
-                llm_message = response.choices[0].message
+                message = response.choices[0].message
+                return model.ModelResponse(
+                    content=message.content or "",
+                    tool_calls=list(message.tool_calls or []),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    finish_reason=response.choices[0].finish_reason,
+                )
+            except Exception as exc:
+                logger.debug(f"Invoking LLM failed: {exc}")
+                if try_num + 1 >= retry:
+                    break
+                time.sleep(base_delay * (2 ** try_num) + random.uniform(0, 1))
 
-                response_content = llm_message.content
-                if response_content is None:
-                    response_content = ""
-
-                tool_calls = []
-                if llm_message.tool_calls: 
-                    for tool_call in llm_message.tool_calls:
-                        tool_calls.append(tool_call)
-
-                reason = response.choices[0].finish_reason
-
-                return response_content , tool_calls , input_tokens , output_tokens , reason
-            except Exception as e:
-                logger.debug(f"Invoking LLM error !!!\nmessage:\n{e}")
-                delay = base_delay * (2 ** try_num) + random.uniform(0, 1)  # 退避策略
-                logger.debug(f"Retrying in {delay:.2f} seconds... "
-                      f"(Attempt {try_num + 1}/{retry})")
-                time.sleep(delay)
-                
-        raise RuntimeError("Invoking LLM error !!!")
+        raise RuntimeError(f"Invoking model {self.model_name} failed after {retry} attempts")

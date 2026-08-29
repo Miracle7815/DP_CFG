@@ -117,6 +117,10 @@ def get_packages(project_path , src_path):
                 father_class = class_map[classs.father_class_name]
                 classs.father_class = father_class
                 father_class.son_classes.add(classs)
+            for interface_name in classs.implement_interfaces.values():
+                interface = class_map.get(interface_name)
+                if interface is not None and interface.is_interface:
+                    interface.son_classes.add(classs)
     
     for single_file in all_files:
         for classs in single_file.classes:

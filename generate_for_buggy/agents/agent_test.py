@@ -1,840 +1,696 @@
-"""
-TestAgent - Generates JUnit test scaffolds, collects constructor info via tools,
-generates per-scenario test methods with proper import merging and indentation,
-and integrates with ReviewerAgent for error diagnosis.
-"""
+"""Source-free, scaffold-first JUnit generation with per-scenario repair."""
+
+from __future__ import annotations
+
 import json
 import os
 import re
+import glob
+from typing import Callable, Optional
 
-from ..config import logger
 from ..basic_class.llm_message import MessageThread
+from ..config import CONFIG, logger
+from ..contracts import ExecutionRecord, validate_scenario
 from ..models import model
-
-from .test_executor import TestExecutor
+from ..privacy import validate_and_record_prompt
+from ..utils.public_api import (
+    class_skeleton,
+    construction_options,
+    is_visible_declaration,
+    sanitise_field_declaration,
+)
+from .attribution_voter import AttributionVoter
 from .coverage_analyzer import CoverageAnalyzer
+from .test_executor import ExecutionResult, TestExecutor
 
 
-# ── Prompt Templates ──────────────────────────────────────────────────
+SCAFFOLD_SYSTEM_PROMPT = """You are an expert Java test engineer. Generate only a minimal JUnit test
+class scaffold for the supplied public API. It must contain the package, valid imports, class declaration,
+and optional shared setup, but no @Test methods and no placeholder assertions. Never request or infer the
+target method body. Output one ```java``` block."""
 
-SCAFFOLD_SYSTEM_PROMPT = """You are an expert Java test engineer. Your task is to generate a JUnit test class SKELETON that compiles successfully.
+CONSTRUCTOR_TOOL_SYSTEM_PROMPT = """Collect only the public or package-access API information needed to
+construct custom input types. Method bodies, private state, source lines, and field initializers are forbidden.
+Use the supplied tools, then output [ANALYSIS_COMPLETE]."""
 
-You will be given:
-- Target method signature
-- Target class name
-- Available imports from the project
-- Parameter types of the target method
+TEST_METHOD_SYSTEM_PROMPT = """Generate one JUnit @Test method for the supplied approved scenario.
+Use only public signatures, documentation, construction options, and the scenario's abstract constraints.
+Choose concrete ordinary inputs yourself, but never infer a hidden implementation threshold. For a coverage
+scenario, use every supplied witness placeholder verbatim; a private local binder will materialize it later.
+The assertion must be justified by oracle_basis. Do not use assertTrue(true), reflection, Unsafe, source code,
+or a fixed program version.
+Mocks are allowed only for publicly injectable dependencies and their behavior must come from public contracts,
+never from a hidden branch condition.
+If oracle_basis is coverage_probe_only, invoke the target using every witness placeholder but emit no assertion;
+the orchestrator will remove this temporary method from the final test suite.
 
-Generate a Java test class with:
-1. Correct package declaration (same package as the target class)
-2. Only imports that exist in the project (use the provided import map)
-3. Test class name: {ClassName}Test
-4. @Before method for common test setup (if needed)
-5. Empty @Test method stubs for each scenario (method name + comment, body is assertTrue(true))
-6. @After method (if cleanup is needed)
-
-IMPORTANT:
-- The skeleton MUST compile. Do not use classes or methods that don't exist.
-- Do NOT implement the test logic yet -- just create the structure.
-- Use JUnit 4 annotations (@Test, @Before, @After).
-- Each @Test stub should have a descriptive name like testScenario_NormalInput and contain only: // Scenario: <description>\n    assertTrue(true);
-
-Output the complete Java code enclosed in ```java ... ```"""
-
-CONSTRUCTOR_TOOL_SYSTEM_PROMPT = """You are gathering constructor information to construct test inputs.
-
-Available tools:
-- `search_constructor(class_name)`: Get all constructor signatures for a class
-- `search_class_skeleton(class_name)`: Get class structure (fields + method signatures)
-- `search_method_source(class_name, method_name)`: Get source code of a called method
-- `search_field_definition(class_name, field_name)`: Get field definition
-
-Process:
-1. For each parameter type of the target method that is NOT a primitive or java.lang type, gather constructor/type information
-2. Call tools to understand how to construct instances of those types
-3. When you have sufficient context, output [ANALYSIS_COMPLETE]
-
-Output format for tool calls:
-```json
-{
-    "tool_calls": [
-        {"tool_name": "search_constructor", "args": {"class_name": "..."}}
-    ]
-}
-```
-
-When analysis is complete, output only: [ANALYSIS_COMPLETE]"""
-
-TEST_METHOD_SYSTEM_PROMPT = """You are an expert Java test engineer. Generate a single JUnit @Test method for a specific test scenario.
-
-You will be given:
-- The test scenario (id, type, description, input, expected_behavior)
-- The target method signature
-- Constructor/type information for building test inputs
-- The test class so far (with other test methods)
-
-Generate ONE @Test method that:
-1. Constructs the input as described in the scenario
-2. Calls the target method with the constructed input
-3. Asserts the expected behavior using Assert.assertEquals, Assert.assertTrue, etc.
-4. Has a clear method name describing what is tested
-
-Rules:
-- Use only classes and methods available in the test class's imports
-- Handle necessary setup (object instantiation, etc.)
-- The method must be self-contained and independent
-
-OUTPUT FORMAT (strictly follow this structure):
+Output exactly:
 ```java
 // IMPORTS
-import com.example.SomeClass;
-import java.util.List;
+// zero or more complete import statements
 // END_IMPORTS
 
 @Test
 public void testMethodName() {
     // test body
 }
-```
-
-The IMPORTS section should ONLY contain imports that are NOT already in the current test class.
-If no new imports are needed, leave the IMPORTS section empty."""
-
-FIX_METHOD_SYSTEM_PROMPT = """Your test method failed to compile or run. Fix it based on the feedback.
-
-Previous method code:
-```java
-{previous_method_code}
-```
-
-Failure details:
-{failure_details}
-
-OUTPUT FORMAT (strictly follow this structure):
-```java
-// IMPORTS
-{new or updated imports, empty if none}
-// END_IMPORTS
-
-@Test
-public void testMethodName() {
-    // corrected test body
-}
 ```"""
 
-# ── Utility: Code Indentation Handling ────────────────────────────────
+FIX_METHOD_SYSTEM_PROMPT = """Repair one generated JUnit test method using the structured diagnostic.
+Preserve the approved scenario semantics. Do not inspect or request source code. If witness placeholders are
+provided, keep them verbatim. Output the same IMPORTS plus one @Test method format."""
 
-CLASS_INDENT = "    "       # 4 spaces: one level inside class body
-METHOD_INDENT = "        "  # 8 spaces: two levels inside class body + method body
+
+CLASS_INDENT = "    "
 
 
 def normalize_method_code(test_method_code: str) -> list[str]:
-    """Strip markdown fences, remove common leading indentation,
-    and return cleaned lines."""
-    lines = test_method_code.strip().split("\n")
-
-    # Remove ```java / ``` fences if present
+    lines = test_method_code.strip().splitlines()
     if lines and lines[0].strip().startswith("```"):
         lines = lines[1:]
     if lines and lines[-1].strip().startswith("```"):
         lines = lines[:-1]
-
-    # Remove empty leading/trailing lines
-    while lines and lines[0].strip() == "":
+    while lines and not lines[0].strip():
         lines.pop(0)
-    while lines and lines[-1].strip() == "":
+    while lines and not lines[-1].strip():
         lines.pop()
-
-    if not lines:
-        return []
-
-    # Detect and strip common leading indent
-    min_indent = None
-    for line in lines:
-        if line.strip() == "":
-            continue
-        leading = len(line) - len(line.lstrip())
-        if min_indent is None or leading < min_indent:
-            min_indent = leading
-
-    if min_indent and min_indent > 0:
-        lines = [line[min_indent:] if len(line) >= min_indent else line.lstrip() for line in lines]
-
-    return lines
+    non_empty = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
+    indent = min(non_empty) if non_empty else 0
+    return [line[indent:] if line.strip() else "" for line in lines]
 
 
-def extract_imports_and_method(test_method_output: str) -> tuple[list[str], str]:
-    """Parse LLM output that contains both IMPORTS section and @Test method code.
-
-    Returns:
-        (new_imports, method_code_without_imports)
-    """
-    # Extract the java code block first
-    pattern = re.compile(r"```java\s*([\s\S]*?)\s*```", re.IGNORECASE)
-    match = pattern.search(test_method_output)
-    if not match:
-        # Fallback: try any code block
-        pattern2 = re.compile(r"```\s*([\s\S]*?)\s*```", re.IGNORECASE)
-        match2 = pattern2.search(test_method_output)
-        if match2:
-            code_block = match2.group(1)
-        else:
-            return [], test_method_output
-    else:
-        code_block = match.group(1)
-
-    # Extract imports section
-    import_pattern = re.compile(
+def extract_imports_and_method(output: str) -> tuple[list[str], str]:
+    fenced = re.search(r"```java\s*([\s\S]*?)\s*```", output, re.IGNORECASE)
+    if not fenced:
+        fenced = re.search(r"```\s*([\s\S]*?)\s*```", output, re.IGNORECASE)
+    code = fenced.group(1) if fenced else output
+    import_section = re.search(
         r"//\s*IMPORTS\s*\n([\s\S]*?)//\s*END_IMPORTS",
-        re.IGNORECASE
+        code,
+        re.IGNORECASE,
     )
-    import_match = import_pattern.search(code_block)
-
-    new_imports = []
-    if import_match:
-        import_section = import_match.group(1).strip()
-        if import_section:
-            for line in import_section.split("\n"):
-                line = line.strip()
-                if line.startswith("import ") and line.endswith(";"):
-                    new_imports.append(line)
-        # Remove the imports section from the code block
-        code_block = code_block[:import_match.start()] + code_block[import_match.end():]
-
-    return new_imports, code_block
+    imports = []
+    if import_section:
+        imports = [
+            line.strip()
+            for line in import_section.group(1).splitlines()
+            if line.strip().startswith("import ") and line.strip().endswith(";")
+        ]
+        code = code[:import_section.start()] + code[import_section.end():]
+    return imports, code.strip()
 
 
 def merge_imports_into_scaffold(scaffold_code: str, new_imports: list[str]) -> str:
-    """Merge new imports into the scaffold's import section.
-
-    Only adds imports that don't already exist in the scaffold.
-    Inserts new imports after the last existing import line.
-    """
-    if not new_imports:
+    existing = {line.strip() for line in scaffold_code.splitlines() if line.strip().startswith("import ")}
+    additions = [item for item in new_imports if item not in existing]
+    if not additions:
         return scaffold_code
-
-    # Collect existing imports
-    existing_imports = set()
-    for line in scaffold_code.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("import "):
-            existing_imports.add(stripped)
-
-    # Filter out duplicates
-    unique_new = [imp for imp in new_imports if imp not in existing_imports]
-    if not unique_new:
-        return scaffold_code
-
-    # Find the last import line in the scaffold
-    lines = scaffold_code.split("\n")
-    last_import_idx = -1
-    for i, line in enumerate(lines):
-        if line.strip().startswith("import "):
-            last_import_idx = i
-
-    if last_import_idx >= 0:
-        # Insert after the last import
-        import_lines = "\n".join(unique_new)
-        lines.insert(last_import_idx + 1, import_lines)
-    else:
-        # No existing imports found, add after package declaration
-        pkg_idx = -1
-        for i, line in enumerate(lines):
-            if line.strip().startswith("package "):
-                pkg_idx = i
-        import_lines = "\n".join(unique_new)
-        if pkg_idx >= 0:
-            lines.insert(pkg_idx + 1, import_lines)
-        else:
-            # Prepend at the beginning
-            lines.insert(0, import_lines)
-
+    lines = scaffold_code.splitlines()
+    insertion = max(
+        [index for index, line in enumerate(lines) if line.strip().startswith("import ")],
+        default=max([index for index, line in enumerate(lines) if line.strip().startswith("package ")], default=-1),
+    )
+    lines[insertion + 1:insertion + 1] = additions
     return "\n".join(lines)
 
 
 def inject_test_method(scaffold_code: str, test_method_code: str) -> str:
-    """Inject a generated test method into the scaffold before the closing '}'.
-
-    Handles indentation: normalizes the generated code and adds CLASS_INDENT (4 spaces)
-    to each line so it sits correctly inside the class body.
-
-    The generated test method from LLM typically looks like:
-        @Test
-        public void methodName() {
-            ...body...
-        }
-
-    After injection, each line gets 4 spaces prepended:
-            @Test
-            public void methodName() {
-                ...body... (extra 4 spaces)
-            }
-    """
     lines = normalize_method_code(test_method_code)
     if not lines:
         return scaffold_code
-
-    # Add CLASS_INDENT to every line
-    indented_lines = []
-    for line in lines:
-        if line.strip() == "":
-            indented_lines.append("")
-        else:
-            indented_lines.append(CLASS_INDENT + line)
-
-    method_block = "\n".join(indented_lines)
-
-    # Find the last closing brace of the class
-    idx = scaffold_code.rfind("}")
-    if idx == -1:
-        return scaffold_code + "\n\n" + method_block + "\n"
-
-    return scaffold_code[:idx] + "\n" + method_block + "\n\n" + scaffold_code[idx:]
+    block = "\n".join(CLASS_INDENT + line if line.strip() else "" for line in lines)
+    closing_brace = scaffold_code.rfind("}")
+    if closing_brace < 0:
+        return scaffold_code + "\n" + block
+    return scaffold_code[:closing_brace] + "\n" + block + "\n\n" + scaffold_code[closing_brace:]
 
 
-def extract_last_method_name(scaffold_code: str, previous_code: str) -> str:
-    """Extract the method name of the last @Test method added to scaffold_code
-    that was not in previous_code."""
-    # Find the @Test method that was added
-    diff = scaffold_code[len(previous_code):] if len(scaffold_code) > len(previous_code) else ""
-    if not diff:
-        return ""
-
-    # Look for @Test followed by method signature in the diff area
-    match = re.search(r"@Test\s*\n\s*public\s+\w+\s+(\w+)\s*\(", diff)
-    if match:
-        return match.group(1)
-
-    # Fallback: find the last method name in the full code
-    matches = re.findall(r"@Test\s*\n\s*public\s+\w+\s+(\w+)\s*\(", scaffold_code)
-    return matches[-1] if matches else ""
+def _method_name(method_code: str, scenario_id: str) -> str:
+    match = re.search(r"(?:public\s+)?void\s+(\w+)\s*\(", method_code)
+    return match.group(1) if match else f"testScenario_{scenario_id}"
 
 
-# ── TestAgent Class ───────────────────────────────────────────────────
+def _normalise_actual_result(result: ExecutionResult) -> str:
+    if result.method_results:
+        method_result = result.method_results[0]
+        return f"{method_result.exception_type or result.status}: {method_result.exception_message or ''}".strip()
+    return f"{result.status}: {result.raw_output[-1000:]}".strip()
+
+
+def _sanitise_diagnostic(text: str) -> str:
+    text = re.sub(r"(?:[A-Za-z]:)?[^\s:()]+\.java:\[?\d+(?:,\d+)?\]?", "<test-source>", text)
+    text = re.sub(r"\([^()]*\.java:\d+\)", "(<source-location>)", text)
+    return text[-3000:]
+
+
+def validate_generated_test_method(method_code: str, coverage_probe_only: bool = False) -> list[str]:
+    issues = []
+    if len(re.findall(r"@Test\b", method_code)) != 1:
+        issues.append("Exactly one @Test method is required")
+    has_assertion = bool(re.search(r"\bassert\w*\s*\(|\bfail\s*\(", method_code))
+    if not has_assertion and not coverage_probe_only:
+        issues.append("The generated method has no test oracle")
+    if coverage_probe_only and has_assertion:
+        issues.append("A temporary coverage probe must not contain an assertion")
+    forbidden = (
+        "java.lang.reflect",
+        "getDeclaredField",
+        "getDeclaredMethod",
+        "setAccessible(",
+        "sun.misc.Unsafe",
+        "jdk.internal.misc.Unsafe",
+    )
+    if any(item in method_code for item in forbidden):
+        issues.append("Reflection and Unsafe are forbidden")
+    if re.search(r"\bassertTrue\s*\(\s*true\s*\)", method_code):
+        issues.append("Placeholder assertions are forbidden")
+    if re.search(r"\bassertFalse\s*\(\s*false\s*\)", method_code):
+        issues.append("Placeholder assertions are forbidden")
+    return issues
+
+
+def remove_test_method(test_class_code: str, method_name: str) -> str:
+    declaration = re.search(
+        rf"@Test\b(?:(?!@Test\b)[\s\S])*?\bvoid\s+{re.escape(method_name)}\s*\([^)]*\)\s*\{{",
+        test_class_code,
+    )
+    if declaration is None:
+        return test_class_code
+    brace_start = test_class_code.find("{", declaration.start())
+    depth = 0
+    quote = None
+    escaped = False
+    for index in range(brace_start, len(test_class_code)):
+        char = test_class_code[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                while end < len(test_class_code) and test_class_code[end] in " \t\r\n":
+                    end += 1
+                return test_class_code[:declaration.start()] + test_class_code[end:]
+    return test_class_code
+
 
 class TestAgent:
-    """Generates JUnit tests for a target method with scaffold-first,
-    per-scenario generation, and coverage-driven iteration.
-
-    Integrates with ReviewerAgent for error diagnosis (methods to be wired up).
-    """
-
     MAX_SCAFFOLD_RETRIES = 2
-    MAX_METHOD_ROUNDS = 3
-    MAX_COVERAGE_ITERATION = 3
 
-    def __init__(self, project_name: str, project_loc: str, test_loc: str,
-                 src_loc: str, method_map: dict, class_map: dict):
+    def __init__(
+        self,
+        project_name: str,
+        project_loc: str,
+        test_loc: str,
+        src_loc: str,
+        method_map: dict,
+        class_map: dict,
+        attribution_voter: Optional[AttributionVoter] = None,
+    ):
         self.project_name = project_name
         self.project_loc = project_loc
         self.test_loc = test_loc
         self.src_loc = src_loc
         self.method_map = method_map
         self.class_map = class_map
-
         self.executor = TestExecutor(project_name, project_loc, test_loc)
-        self.coverage_analyzer = CoverageAnalyzer(project_name, project_loc, src_loc)
-
-        # Collected constructor/type info
-        self.constructor_info = {}
-
+        self.coverage_analyzer = CoverageAnalyzer(project_name, project_loc, src_loc, test_loc)
+        self.coverage_analyzer.witness_binder.set_class_map(class_map)
+        self.attribution_voter = attribution_voter or AttributionVoter()
+        self.constructor_info: dict[str, dict] = {}
+        self.test_environment: dict = {}
         self.target_method = None
         self.test_class_sig = None
         self.test_class_code = ""
-        self.scenario_results = {}  # {scenario_id: {"status": ..., "method_name": ..., "exec_result": ...}}
-
-        # ReviewerAgent reference (set externally)
+        self.public_context = ""
         self.reviewer_agent = None
+        self.coverage_goals: dict[str, dict] = {}
+        self.witness_binder = None
+        self.coverage_verifier: Optional[Callable[[str, str, str], tuple[bool, dict]]] = None
 
     def set_reviewer_agent(self, reviewer_agent):
-        """Set the ReviewerAgent reference for error diagnosis."""
         self.reviewer_agent = reviewer_agent
 
-    # ── Tool Implementations ──────────────────────────────────────────
+    def set_public_context(self, context: str) -> None:
+        self.public_context = context
+
+    def set_coverage_runtime(self, goals=None, witness_binder=None, verifier=None) -> None:
+        self.coverage_goals = goals or {}
+        self.witness_binder = witness_binder
+        if witness_binder is not None and hasattr(witness_binder, "set_class_map"):
+            witness_binder.set_class_map(self.class_map)
+        self.coverage_verifier = verifier
+
+    def _call_model(self, messages, **kwargs):
+        validate_and_record_prompt(messages, "test", self.target_method)
+        selected = model.require_model(model.SELECTED_MODEL, "selected")
+        return selected.call(messages, **kwargs)
 
     def search_constructor(self, class_name: str) -> str:
-        """Get constructor signatures for a class."""
-        for cn, cls in self.class_map.items():
-            if cn == class_name:
-                constructors = cls.constructor if hasattr(cls, 'constructor') else []
-                if constructors:
-                    return "\n".join(f"  {c.signature}" for c in constructors)
-                return f"  No constructors found for {class_name} (default constructor available)"
-        return f"  Class {class_name} not found in class_map"
+        class_obj = self.class_map.get(class_name)
+        if class_obj is None:
+            return json.dumps({"class": class_name, "error": "class_not_found"})
+        return json.dumps(construction_options(class_obj), ensure_ascii=False)
 
     def search_class_skeleton(self, class_name: str) -> str:
-        """Get class structure: fields + method signatures."""
-        for cn, cls in self.class_map.items():
-            if cn == class_name:
-                skeleton = f"{cls.signature}\n"
-                skeleton += "  Fields:\n"
-                for field_name, stmt in cls.fields.items():
-                    skeleton += f"    {stmt}\n"
-                constructors = cls.constructor if hasattr(cls, 'constructor') else []
-                if constructors:
-                    skeleton += "  Constructors:\n"
-                    for c in constructors:
-                        skeleton += f"    {c.signature}\n"
-                skeleton += "  Methods:\n"
-                for m in cls.methods:
-                    skeleton += f"    {m.signature}\n"
-                return skeleton
-        return f"  Class {class_name} not found"
+        class_obj = self.class_map.get(class_name)
+        return class_skeleton(class_obj) if class_obj is not None else "Class not found"
 
-    def search_method_source(self, class_name: str, method_name: str) -> str:
-        """Get source code of a called method."""
-        for cn, cls in self.class_map.items():
-            if cn == class_name:
-                for method in cls.methods:
-                    if method.name_no_package == method_name:
-                        return f"{method.signature}\n{method.content}"
-                return f"  Method {method_name} not found in {class_name}"
-        return f"  Class {class_name} not found"
+    def search_method_contract(self, class_name: str, method_name: str) -> str:
+        class_obj = self.class_map.get(class_name)
+        if class_obj is None:
+            return "Class not found"
+        contracts = [
+            {"signature": item.signature, "javadoc": item.javadoc or "No javadoc available."}
+            for item in class_obj.methods
+            if item.name_no_package == method_name and is_visible_declaration(item.content)
+        ]
+        return json.dumps(contracts, ensure_ascii=False)
 
     def search_field_definition(self, class_name: str, field_name: str) -> str:
-        """Get field definition."""
-        for cn, cls in self.class_map.items():
-            if cn == class_name:
-                for fname, stmt in cls.fields.items():
-                    if fname == field_name:
-                        return stmt
-                return f"  Field {field_name} not found in {class_name}"
-        return f"  Class {class_name} not found"
+        class_obj = self.class_map.get(class_name)
+        if class_obj is None or field_name not in class_obj.fields:
+            return "Field not found"
+        statement = class_obj.fields[field_name]
+        if not is_visible_declaration(statement):
+            return "Field is not part of the visible API"
+        return sanitise_field_declaration(statement)
 
-    # ── Constructor Info Collection (ReAct) ───────────────────────────
+    def discover_test_environment(self) -> dict:
+        environment = {
+            "build_adapter": "maven" if os.path.isfile(os.path.join(self.project_loc, "pom.xml")) else "defects4j",
+            "junit_style": "unknown",
+            "test_imports": [],
+            "test_method_prefixes": [],
+        }
+        pom = os.path.join(self.project_loc, "pom.xml")
+        if os.path.isfile(pom):
+            try:
+                with open(pom, "r", encoding="utf-8") as handle:
+                    pom_text = handle.read()
+                artifacts = re.findall(r"<artifactId>\s*([^<]+)\s*</artifactId>", pom_text)
+                environment["test_dependencies"] = sorted({
+                    item.strip() for item in artifacts
+                    if any(marker in item.lower() for marker in ("junit", "testng", "assertj", "hamcrest"))
+                })
+            except OSError:
+                environment["test_dependencies"] = []
+
+        test_root = self.test_loc if os.path.isabs(self.test_loc) else os.path.join(self.project_loc, self.test_loc)
+        imports = set()
+        prefixes = set()
+        junit_counts = {"junit5": 0, "junit4": 0, "junit3": 0}
+        for path in glob.glob(os.path.join(test_root, "**", "*.java"), recursive=True)[:50]:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            imports.update(re.findall(r"^\s*import\s+([^;]+);", text, re.MULTILINE))
+            if "org.junit.jupiter.api.Test" in text:
+                junit_counts["junit5"] += 1
+            if "org.junit.Test" in text:
+                junit_counts["junit4"] += 1
+            if "junit.framework.TestCase" in text:
+                junit_counts["junit3"] += 1
+            for name in re.findall(r"@Test(?:\([^)]*\))?\s+(?:public\s+)?void\s+(\w+)\s*\(", text):
+                prefix = re.match(r"[a-z]+", name)
+                if prefix:
+                    prefixes.add(prefix.group(0))
+        if max(junit_counts.values(), default=0) > 0:
+            environment["junit_style"] = max(junit_counts, key=junit_counts.get)
+        environment["test_imports"] = sorted(imports)[:30]
+        environment["test_method_prefixes"] = sorted(prefixes)[:10]
+        self.test_environment = environment
+        return environment
+
+    def current_test_imports(self) -> list[str]:
+        return sorted({
+            line.strip()
+            for line in self.test_class_code.splitlines()
+            if line.strip().startswith("import ") and line.strip().endswith(";")
+        })
 
     def collect_constructor_info(self, target_method, max_turns: int = 8):
-        """ReAct loop to collect constructor/type info for non-primitive parameter types."""
         self.target_method = target_method
-        self.constructor_info = {}
-
-        # Determine which parameter types need constructor info
-        non_primitive_types = []
-        for param in target_method.parameters_list:
-            type_name = param.split(".")[-1]
-            if type_name in ("byte", "short", "int", "long", "float", "double", "boolean", "char",
-                             "Byte", "Short", "Integer", "Long", "Float", "Double", "Boolean",
-                             "Character", "String"):
-                continue
-            non_primitive_types.append(param)
-
-        if not non_primitive_types:
-            logger.info("No non-primitive parameters, skipping constructor info collection")
+        custom_types = [
+            parameter for parameter in target_method.parameters_list
+            if parameter.rsplit(".", 1)[-1] not in {
+                "byte", "short", "int", "long", "float", "double", "boolean", "char",
+                "Byte", "Short", "Integer", "Long", "Float", "Double", "Boolean", "Character", "String",
+            }
+        ]
+        if not getattr(target_method, "is_static", False):
+            receiver_type = target_method.belong_class.name
+            if receiver_type not in custom_types:
+                custom_types.append(receiver_type)
+        if not custom_types:
             return
 
         thread = MessageThread()
-        param_desc = "\n".join(f"  - {p}" for p in non_primitive_types)
         thread.add_system(CONSTRUCTOR_TOOL_SYSTEM_PROMPT)
-        thread.add_user(f"Target method: {target_method.signature}\n\n"
-                        f"Parameter types that need constructor info:\n{param_desc}")
+        thread.add_user(
+            f"Target method: {target_method.signature}\nCustom constructible parameter/receiver types:\n" +
+            "\n".join(f"- {item}" for item in custom_types)
+        )
 
-        logger.info(f"Collecting constructor info for {len(non_primitive_types)} types")
-
-        for turn in range(max_turns):
-            response, tool_calls, *_ = model.SELECTED_MODEL.call(thread.to_msg(), self._constructor_tools())
-
-            if "[ANALYSIS_COMPLETE]" in response:
+        for _ in range(max_turns):
+            response = self._call_model(thread.to_msg(), tools=self._constructor_tools())
+            if "[ANALYSIS_COMPLETE]" in response.content:
                 break
+            thread.add_model(response.content, response.tool_calls)
+            if not response.tool_calls:
+                thread.add_user("Call a public-context tool or output [ANALYSIS_COMPLETE].")
+                continue
+            for tool_call in response.tool_calls:
+                try:
+                    args = json.loads(tool_call.function.arguments)
+                except (TypeError, json.JSONDecodeError):
+                    args = {}
+                tool_name = tool_call.function.name
+                if tool_name == "search_constructor":
+                    result = self.search_constructor(args.get("class_name", ""))
+                    try:
+                        self.constructor_info[args.get("class_name", "")] = json.loads(result)
+                    except json.JSONDecodeError:
+                        pass
+                elif tool_name == "search_class_skeleton":
+                    result = self.search_class_skeleton(args.get("class_name", ""))
+                elif tool_name == "search_method_contract":
+                    result = self.search_method_contract(
+                        args.get("class_name", ""), args.get("method_name", "")
+                    )
+                elif tool_name == "search_field_definition":
+                    result = self.search_field_definition(
+                        args.get("class_name", ""), args.get("field_name", "")
+                    )
+                else:
+                    result = "Unknown tool"
+                thread.add_tool_result(tool_call.id, result)
 
-            # Execute tool calls
-            if tool_calls:
-                for tc in tool_calls:
-                    tool_name = tc.function.name
-                    args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
-
-                    if tool_name == "search_constructor":
-                        result = self.search_constructor(args.get("class_name", ""))
-                        self.constructor_info[args.get("class_name", "")] = result
-                        thread.add_tool_result(tc.id, result)
-                    elif tool_name == "search_class_skeleton":
-                        result = self.search_class_skeleton(args.get("class_name", ""))
-                        thread.add_tool_result(tc.id, result)
-                    elif tool_name == "search_method_source":
-                        result = self.search_method_source(
-                            args.get("class_name", ""), args.get("method_name", "")
-                        )
-                        thread.add_tool_result(tc.id, result)
-                    elif tool_name == "search_field_definition":
-                        result = self.search_field_definition(
-                            args.get("class_name", ""), args.get("field_name", "")
-                        )
-                        thread.add_tool_result(tc.id, result)
-            else:
-                thread.add_user("If you need more information, call the tools. Otherwise output [ANALYSIS_COMPLETE]")
-
-    def _constructor_tools(self):
+    @staticmethod
+    def _constructor_tools() -> list[dict]:
+        class_name = {
+            "type": "string",
+            "description": "Fully qualified project class name",
+        }
         return [
             {
                 "type": "function",
                 "function": {
                     "name": "search_constructor",
-                    "description": "Get all constructor signatures for a class",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "class_name": {"type": "string", "description": "Full class name (e.g., org.apache.commons.lang3.math.NumberUtils)"}
-                        },
-                        "required": ["class_name"]
-                    }
-                }
+                    "description": "Get visible constructors, factories, builders, setters, and implementations",
+                    "parameters": {"type": "object", "properties": {"class_name": class_name}, "required": ["class_name"]},
+                },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "search_class_skeleton",
-                    "description": "Get class structure (fields + method signatures)",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "class_name": {"type": "string", "description": "Full class name"}
-                        },
-                        "required": ["class_name"]
-                    }
-                }
+                    "description": "Get a source-free public class skeleton",
+                    "parameters": {"type": "object", "properties": {"class_name": class_name}, "required": ["class_name"]},
+                },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "search_method_source",
-                    "description": "Get source code of a called method",
+                    "name": "search_method_contract",
+                    "description": "Get visible method signatures and javadocs",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "class_name": {"type": "string", "description": "Full class name"},
-                            "method_name": {"type": "string", "description": "Method name"}
+                            "class_name": class_name,
+                            "method_name": {"type": "string"},
                         },
-                        "required": ["class_name", "method_name"]
-                    }
-                }
+                        "required": ["class_name", "method_name"],
+                    },
+                },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "search_field_definition",
-                    "description": "Get field definition",
+                    "description": "Get a visible field declaration without its initializer",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "class_name": {"type": "string", "description": "Full class name"},
-                            "field_name": {"type": "string", "description": "Field name"}
+                            "class_name": class_name,
+                            "field_name": {"type": "string"},
                         },
-                        "required": ["class_name", "field_name"]
-                    }
-                }
+                        "required": ["class_name", "field_name"],
+                    },
+                },
             },
         ]
 
-    # ── Scaffold Generation ───────────────────────────────────────────
-
     def generate_scaffold(self, test_scenarios: dict, import_map: dict) -> tuple[str, str]:
-        """Generate test class scaffold. Returns (test_class_sig, scaffold_code)."""
+        del test_scenarios
+        test_environment = self.discover_test_environment()
         target = self.target_method
         class_name = target.belong_class.name_no_package
         package_name = target.belong_package.name
-
-        # Build scenario stub descriptions
-        scenario_stubs = []
-        for s in test_scenarios.get("test_scenarios", []):
-            scenario_stubs.append({
-                "id": s["id"],
-                "type": s["category"],
-                "description": s["description"],
-                "method_name": self._scenario_to_method_name(s),
-            })
-
-        prompt = SCAFFOLD_SYSTEM_PROMPT.format(ClassName=class_name)
-
-        import_list = "\n".join(f"  {v}" for v in import_map.values()) if import_map else "  No specific imports"
-
-        user_msg = (
-            f"Target class: {class_name}\n"
-            f"Package: {package_name}\n"
-            f"Method signature: {target.signature}\n"
-            f"Available imports:\n{import_list}\n\n"
-            f"Test scenarios to create stubs for:\n"
-        )
-        for stub in scenario_stubs:
-            user_msg += (
-                f"  - {stub['id']} ({stub['type']}): {stub['description']}\n"
-                f"    Method name: {stub['method_name']}\n"
-            )
-
+        generated_class_name = f"{class_name}GeneratedTest"
+        test_class_sig = f"{package_name}.{generated_class_name}"
         thread = MessageThread()
-        thread.add_system(prompt)
-        thread.add_user(user_msg)
+        thread.add_system(SCAFFOLD_SYSTEM_PROMPT)
+        thread.add_user(
+            f"Target class: {class_name}\nPackage: {package_name}\n"
+            f"Required test class name: {generated_class_name}\n"
+            f"Method signature: {target.signature}\nAvailable imports:\n" +
+            ("\n".join(import_map.values()) if import_map else "No project imports") +
+            "\nSource-free project test environment:\n" +
+            json.dumps(test_environment, ensure_ascii=False, indent=2)
+        )
 
-        scaffold = None
-        for attempt in range(self.MAX_SCAFFOLD_RETRIES):
-            response, *_ = model.SELECTED_MODEL.call(thread.to_msg())
-            logger.info(f"Scaffold generation attempt {attempt + 1}")
-
-            # Extract Java code
+        scaffold = ""
+        for _ in range(self.MAX_SCAFFOLD_RETRIES):
+            response = self._call_model(thread.to_msg()).content
             scaffold = self._extract_java_code(response)
             if not scaffold:
-                thread.add_user("The code block was not found. Please output the Java code enclosed in ```java ... ```")
+                thread.add_user("Return one Java code block containing the scaffold.")
                 continue
-
-            # Compile check
-            test_class_sig = f"{package_name}.{class_name}Test"
-            ok, err = self.executor.compile_test(scaffold, test_class_sig)
+            ok, error = self.executor.compile_test(scaffold, test_class_sig)
             if ok:
                 self.test_class_sig = test_class_sig
                 self.test_class_code = scaffold
-                logger.info(f"Scaffold compiled successfully: {test_class_sig}")
                 return test_class_sig, scaffold
+            thread.add_user(f"The scaffold did not compile. Diagnostic:\n{_sanitise_diagnostic(error)}")
 
-            thread.add_user(f"Compilation failed:\n{err}\n\nPlease fix and regenerate the scaffold.")
+        self.test_class_sig = test_class_sig
+        self.test_class_code = scaffold
+        return test_class_sig, ""
 
-        # If all retries failed, return what we have
-        self.test_class_sig = f"{package_name}.{class_name}Test"
-        self.test_class_code = scaffold if scaffold else ""
-        return self.test_class_sig, self.test_class_code
-
-    # ── Per-Scenario Test Generation ──────────────────────────────────
-
-    def generate_test_for_scenario(self, scenario: dict, test_scenarios: dict) -> dict:
-        """Generate a single @Test method for a scenario and inject it.
-
-        Returns a result dict:
-        {
-            "scenario_id": str,
-            "method_name": str,
-            "status": "passed" | "failed" | "bug_detected" | "test_issue" | "needs_regeneration",
-            "exec_result": ExecutionResult | None,   # Only for the newly added method
-            "reviewer_diagnosis": dict | None,       # From ReviewerAgent (when implemented)
-        }
-
-        Note: Error diagnosis is delegated to ReviewerAgent.
-        The actual diagnosis logic will be wired up when ReviewerAgent is implemented.
-        """
-        result = {
-            "scenario_id": scenario["id"],
-            "method_name": "",
-            "status": "failed",
-            "exec_result": None,
-            "reviewer_diagnosis": None,
-        }
+    def generate_test_for_scenario(self, scenario: dict, scenario_file: dict) -> dict:
+        contract_issues = validate_scenario(scenario)
+        record = ExecutionRecord(scenario_id=scenario.get("id", "unknown"))
+        if contract_issues or scenario.get("status") != "approved":
+            record.diagnostics.extend(contract_issues or ["Scenario is not approved"])
+            return record.to_dict()
 
         previous_code = self.test_class_code
+        previous_method = ""
+        feedback = ""
+        coverage_probe_only = scenario.get("oracle_basis") == "coverage_probe_only"
+        max_rounds = int(CONFIG["pipeline"]["test_repair_retries"])
+        construction_limit = int(CONFIG["pipeline"]["object_construction_retries"])
+        construction_attempts = 0
 
-        for round_idx in range(self.MAX_METHOD_ROUNDS):
-            # Generate test method (includes imports + code)
-            test_method_output = self._generate_test_method(scenario, test_scenarios)
-            if not test_method_output:
-                result["status"] = "failed"
-                return result
-
-            # Parse: extract new imports and method code
-            new_imports, method_code = extract_imports_and_method(test_method_output)
-            if not method_code.strip():
+        for round_index in range(max_rounds):
+            output = self._generate_test_method(
+                scenario,
+                scenario_file,
+                previous_method=previous_method,
+                feedback=feedback,
+            )
+            imports, generated_method = extract_imports_and_method(output)
+            if not generated_method:
+                feedback = "No JUnit method was returned."
+                record.diagnostics.append(feedback)
+                continue
+            method_issues = validate_generated_test_method(
+                generated_method,
+                coverage_probe_only=coverage_probe_only,
+            )
+            if method_issues:
+                feedback = "; ".join(method_issues)
+                record.diagnostics.append(feedback)
+                previous_method = generated_method
                 continue
 
-            # Extract method name
-            method_name_match = re.search(r"public\s+\w+\s+(\w+)\s*\(", method_code)
-            method_name = method_name_match.group(1) if method_name_match else f"testScenario_{scenario['id']}"
-            result["method_name"] = method_name
+            materialized_method = generated_method
+            goal_id = scenario.get("coverage_goal_id")
+            if goal_id and self.witness_binder is not None:
+                try:
+                    materialized_method = self.witness_binder.materialize_test_method(goal_id, generated_method)
+                except Exception as exc:
+                    construction_attempts += 1
+                    feedback = f"Witness materialization failed: {exc}"
+                    record.diagnostics.append(feedback)
+                    previous_method = generated_method
+                    if construction_attempts >= construction_limit:
+                        record.final_status = self._construction_failure_status(goal_id)
+                        self.executor.write_test(previous_code, self.test_class_sig)
+                        return record.to_dict()
+                    continue
 
-            # Merge new imports into scaffold
-            self.test_class_code = merge_imports_into_scaffold(self.test_class_code, new_imports)
+            method_name = _method_name(materialized_method, scenario["id"])
+            candidate = merge_imports_into_scaffold(previous_code, imports)
+            candidate = inject_test_method(candidate, materialized_method)
+            execution = self.executor.diagnose(candidate, self.test_class_sig, method_name)
 
-            # Inject test method (handles indentation)
-            self.test_class_code = inject_test_method(self.test_class_code, method_code)
+            record.method_name = method_name
+            record.retries = round_index
+            record.compile_status = "passed" if execution.status != "COMPILATION_ERROR" else "failed"
+            record.run_status = execution.status
+            record.failure_kind = None if execution.status == "ALL_PASSED" else execution.status
 
-            # Compile
-            ok, compile_err = self.executor.compile_test(self.test_class_code, self.test_class_sig)
-            if not ok:
-                logger.info(f"Scenario {scenario['id']} round {round_idx + 1}: compilation failed")
-                # Rollback: remove the last added method and imports
-                self.test_class_code = previous_code
+            if execution.status == "ALL_PASSED":
+                target_hit, coverage_delta = self._verify_coverage_goal(goal_id, method_name, candidate)
+                record.target_hit = target_hit
+                record.coverage_delta = coverage_delta
+                if goal_id and not target_hit:
+                    construction_attempts += 1
+                    feedback = "The test passed but did not hit its CoverageGoal. Change only the construction route or witness placeholders."
+                    record.diagnostics.append(feedback)
+                    previous_method = generated_method
+                    if construction_attempts >= construction_limit:
+                        record.final_status = self._construction_failure_status(goal_id)
+                        self.executor.write_test(previous_code, self.test_class_sig)
+                        return record.to_dict()
+                    continue
+                self.test_class_code = candidate
+                scenario["status"] = "implemented"
+                record.final_status = "coverage_probe" if coverage_probe_only else "passed"
+                return record.to_dict()
 
-                # TODO: Wire up ReviewerAgent for compilation error diagnosis
-                # When ReviewerAgent is ready:
-                # diagnosis = self.reviewer_agent.review_test_failure(
-                #     scenario=scenario,
-                #     test_code=method_code,
-                #     failure_type="COMPILATION_ERROR",
-                #     failure_details=compile_err,
-                # )
-                # Then act on diagnosis: fix / regenerate / skip
-                return result
+            if execution.status == "ASSERTION_FAILURE":
+                target_hit, coverage_delta = self._verify_coverage_goal(goal_id, method_name, candidate)
+                record.target_hit = target_hit
+                record.coverage_delta = coverage_delta
+                if goal_id and not target_hit:
+                    construction_attempts += 1
+                    feedback = "The assertion failed before the required CoverageGoal was verified. Repair path reachability first."
+                    record.diagnostics.append(feedback)
+                    previous_method = generated_method
+                    if construction_attempts >= construction_limit:
+                        record.final_status = self._construction_failure_status(goal_id)
+                        self.executor.write_test(previous_code, self.test_class_sig)
+                        return record.to_dict()
+                    continue
 
-            # Run tests
-            full_exec_result = self.executor.run_test(self.test_class_sig)
+                attribution = self.attribution_voter.attribute(
+                    scenario=scenario,
+                    test_method=generated_method,
+                    actual_result=_normalise_actual_result(execution),
+                    method_signature=self.target_method.signature,
+                    javadoc=self.target_method.javadoc or "",
+                    public_context=self.public_context,
+                )
+                record.attribution = attribution
+                if attribution["decision"] == "source_bug":
+                    self.test_class_code = candidate
+                    scenario["status"] = "implemented"
+                    record.final_status = "source_bug"
+                    return record.to_dict()
+                if attribution["decision"] == "test_issue":
+                    feedback = attribution.get("fix_instructions") or "Repair the test oracle or implementation."
+                    record.diagnostics.append(feedback)
+                    previous_method = generated_method
+                    continue
+                record.final_status = "ambiguous"
+                record.diagnostics.append(attribution.get("reason", "Attribution was ambiguous"))
+                self.executor.write_test(previous_code, self.test_class_sig)
+                return record.to_dict()
 
-            # Extract only the newly added method's execution result
-            method_result = self._extract_method_result(full_exec_result, method_name)
-            result["exec_result"] = method_result
+            feedback = self._repair_feedback(execution)
+            record.diagnostics.append(feedback)
+            previous_method = generated_method
 
-            if full_exec_result.status == "ALL_PASSED":
-                logger.info(f"Scenario {scenario['id']} ({method_name}) passed on round {round_idx + 1}")
-                result["status"] = "passed"
-                return result
+        record.final_status = "test_invalid"
+        self.executor.write_test(previous_code, self.test_class_sig)
+        return record.to_dict()
 
-            # Test failed - delegate to ReviewerAgent for diagnosis
-            logger.info(f"Scenario {scenario['id']} ({method_name}) round {round_idx + 1}: {full_exec_result.status}")
+    def _verify_coverage_goal(self, goal_id: Optional[str], method_name: str, candidate: str) -> tuple[Optional[bool], dict]:
+        if not goal_id:
+            return None, {}
+        if self.coverage_verifier is None:
+            return False, {"status": "coverage_unverified"}
+        try:
+            return self.coverage_verifier(goal_id, method_name, candidate)
+        except Exception as exc:
+            return False, {"status": "coverage_verification_error", "reason": str(exc)}
 
-            if self.reviewer_agent is not None:
-                # TODO: Wire up ReviewerAgent diagnosis flow
-                # diagnosis = self.reviewer_agent.review_test_failure(
-                #     scenario=scenario,
-                #     test_code=method_code,
-                #     failure_type=full_exec_result.status,
-                #     failure_details=method_result,
-                # )
-                #
-                # if diagnosis["diagnosis"] == "bug_detected":
-                #     result["status"] = "bug_detected"
-                #     result["reviewer_diagnosis"] = diagnosis
-                #     return result
-                # elif diagnosis["diagnosis"] == "test_issue":
-                #     # Fix test method based on reviewer's instructions
-                #     continue
-                # elif diagnosis["diagnosis"] == "needs_regeneration":
-                #     # Regenerate with different approach
-                #     continue
+    def _construction_failure_status(self, goal_id: Optional[str]) -> str:
+        if goal_id and self.witness_binder is not None:
+            try:
+                if any(
+                    slot.get("role") == "custom_object_leaf"
+                    for slot in self.witness_binder.public_slots(goal_id)
+                ):
+                    return "uncontrollable_object_state"
+            except KeyError:
                 pass
+        return "unconstructable_input"
 
-            # Without ReviewerAgent, rollback and stop
-            self.test_class_code = previous_code
-            return result
-
-        return result
-
-    def _generate_test_method(self, scenario: dict, test_scenarios: dict) -> str:
-        """LLM call to generate a single @Test method (with imports)."""
-        constructor_info_str = ""
-        for cls_name, info in self.constructor_info.items():
-            constructor_info_str += f"\n  Constructor info for {cls_name}:\n{info}\n"
-
-        user_msg = (
-            f"Target method: {self.target_method.signature}\n"
-            f"Test scenarios file:\n{json.dumps(test_scenarios, indent=2)}\n\n"
-            f"Current scenario to implement:\n"
-            f"  ID: {scenario['id']}\n"
-            f"  Type: {scenario['type']}\n"
-            f"  Description: {scenario['description']}\n"
-            f"  Input: {scenario['input']}\n"
-            f"  Expected: {scenario['expected_behavior']}\n\n"
-            f"Constructor/type info collected:{constructor_info_str}\n\n"
-            f"Current test class code (use this to know which imports already exist):\n```java\n{self.test_class_code}\n```"
-        )
+    def _generate_test_method(
+        self,
+        scenario: dict,
+        scenario_file: dict,
+        previous_method: str = "",
+        feedback: str = "",
+    ) -> str:
+        constructor_context = json.dumps(self.constructor_info, ensure_ascii=False, indent=2)
+        goal = self.coverage_goals.get(scenario.get("coverage_goal_id", ""))
+        witness_slots = []
+        if goal and self.witness_binder is not None:
+            witness_slots = self.witness_binder.public_slots(goal["goal_id"])
 
         thread = MessageThread()
-        thread.add_system(TEST_METHOD_SYSTEM_PROMPT)
-        thread.add_user(user_msg)
-
-        response, *_ = model.SELECTED_MODEL.call(thread.to_msg())
-        return response
-
-    # ── Coverage-Driven Scenario Supplementation ──────────────────────
-
-    def analyze_coverage_and_supplement(self, test_scenarios: dict) -> list[dict]:
-        """Run coverage analysis, find uncovered regions, generate new scenarios."""
-        if not self.test_class_sig:
-            return []
-
-        # Collect and analyze coverage
-        coverage_info = self.coverage_analyzer.collect_and_update(self.target_method, self.test_class_sig)
-
-        best_path = coverage_info.get("best_path")
-        if not best_path:
-            logger.info("No uncovered paths found via coverage analysis")
-            return []
-
-        uncovered_lines = coverage_info.get("missed_lines", [])
-        branch_conditions = best_path.get("branch_conditions", [])
-
-        logger.info(f"Uncovered lines: {uncovered_lines}")
-        logger.info(f"Uncovered branch conditions: {branch_conditions}")
-
-        context_msg = (
-            f"Method: {self.target_method.signature}\n"
-            f"Javadoc: {self.target_method.javadoc or 'No javadoc'}\n"
-            f"Uncovered lines: {uncovered_lines}\n"
-            f"Uncovered branch conditions:\n"
-        )
-        for bc in branch_conditions:
-            context_msg += f"  Line {bc['line']}: {bc['statement']} ({bc['conditional']})\n"
-
-        # Generate new scenarios via LLM
-        thread = MessageThread()
-        thread.add_system(
-            "You are generating additional test scenarios to improve code coverage. "
-            "For each uncovered region, analyze what input conditions might reach that code path. "
-            "Generate new scenarios with type 'edge_case' or 'suspicious'. "
-            "Output a JSON array of scenarios, each with: id, type, description, input, expected_behavior, rationale, priority."
-        )
-        thread.add_user(
-            f"Original scenarios:\n{json.dumps(test_scenarios.get('test_scenarios', []), indent=2)}\n\n"
-            f"Uncovered context:\n{context_msg}"
-        )
-
-        response, *_ = model.SELECTED_MODEL.call(thread.to_msg())
-        new_scenarios = self._extract_json_array(response)
-
-        if not new_scenarios:
-            logger.info("No new scenarios generated from coverage analysis")
-            return []
-
-        logger.info(f"Generated {len(new_scenarios)} new scenarios from coverage feedback")
-        return new_scenarios
-
-    # ── Helper Methods ────────────────────────────────────────────────
-
-    def _scenario_to_method_name(self, scenario: dict) -> str:
-        """Convert scenario description to a valid Java method name."""
-        desc = scenario.get("description", "test")
-        name = re.sub(r"[^a-zA-Z0-9\s]", "", desc)
-        words = name.lower().split()
-        if not words:
-            return "testScenario"
-        return "test" + "".join(w.capitalize() for w in words)
-
-    def _extract_java_code(self, response: str) -> str:
-        """Extract Java code from markdown code block."""
-        pattern = re.compile(r"```java\s*([\s\S]*?)\s*```", re.IGNORECASE)
-        match = pattern.search(response)
-        if match:
-            return match.group(1)
-        pattern2 = re.compile(r"```\s*([\s\S]*?)\s*```", re.IGNORECASE)
-        match2 = pattern2.search(response)
-        if match2:
-            return match2.group(1)
-        return ""
-
-    def _extract_json_array(self, response: str) -> list:
-        """Extract a JSON array from response."""
-        pattern = re.compile(r"```\s*json\s*([\s\S]*?)\s*```", re.IGNORECASE)
-        match = pattern.search(response)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-        pattern2 = re.compile(r"\[\s*\{.*\}\s*\]", re.DOTALL)
-        match2 = pattern2.search(response)
-        if match2:
-            try:
-                return json.loads(match2.group(0))
-            except json.JSONDecodeError:
-                pass
-        return []
-
-    def _extract_method_result(self, full_exec_result, method_name: str):
-        """Extract the execution result for a specific test method from the full ExecutionResult.
-
-        Only returns the result for the newly added method, preserving earlier
-        methods' results (which may be bug-detecting).
-        """
-        if full_exec_result is None:
-            return None
-
-        for mr in full_exec_result.method_results:
-            if mr.method_name == method_name:
-                return mr
-
-        # If not found in method_results, return a summary
-        return {
-            "method_name": method_name,
-            "overall_status": full_exec_result.status,
+        thread.add_system(FIX_METHOD_SYSTEM_PROMPT if previous_method else TEST_METHOD_SYSTEM_PROMPT)
+        payload = {
+            "method_signature": self.target_method.signature,
+            "method_intent": scenario_file.get("method_intent", ""),
+            "scenario": scenario,
+            "public_constructor_context": self.constructor_info,
+            "test_environment": self.test_environment,
+            "current_test_imports": self.current_test_imports(),
+            "coverage_goal": goal,
+            "witness_placeholders": witness_slots,
         }
+        message = json.dumps(payload, ensure_ascii=False, indent=2)
+        if previous_method:
+            message += f"\n\nPrevious generated method:\n```java\n{previous_method}\n```\n\nDiagnostic:\n{feedback[-3000:]}"
+        thread.add_user(message)
+        return self._call_model(thread.to_msg()).content
+
+    @staticmethod
+    def _repair_feedback(execution: ExecutionResult) -> str:
+        if execution.status == "COMPILATION_ERROR":
+            return "Compilation failed:\n" + _sanitise_diagnostic("\n".join(execution.compile_errors[:10]))
+        if execution.status == "RUNTIME_ERROR":
+            return "Test setup or invocation failed before a valid assertion result:\n" + _normalise_actual_result(execution)
+        if execution.status == "TIMEOUT":
+            return "The isolated test timed out; simplify setup and avoid unbounded operations."
+        return f"Execution was not successful ({execution.status}):\n{_sanitise_diagnostic(execution.raw_output)}"
+
+    @staticmethod
+    def _scenario_to_method_name(scenario: dict) -> str:
+        words = re.sub(r"[^A-Za-z0-9\s]", "", scenario.get("description", "test")).split()
+        return "test" + "".join(word[:1].upper() + word[1:] for word in words) if words else "testScenario"
+
+    @staticmethod
+    def _extract_java_code(response: str) -> str:
+        match = re.search(r"```java\s*([\s\S]*?)\s*```", response, re.IGNORECASE)
+        if not match:
+            match = re.search(r"```\s*([\s\S]*?)\s*```", response, re.IGNORECASE)
+        return match.group(1).strip() if match else ""

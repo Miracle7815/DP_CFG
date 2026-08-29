@@ -1,15 +1,25 @@
-"""
-TestExecutor - Deterministic test compilation, execution, and result parsing.
-Called by TestAgent. Not an LLM agent.
-"""
+"""Deterministic, method-isolated Java test compilation and execution."""
+
+from __future__ import annotations
+
 import os
 import re
 import subprocess
-import shutil
-from dataclasses import dataclass, field
+import time
+import glob
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from ..config import logger
+from ..config import CONFIG
+
+
+@dataclass
+class CommandResult:
+    returncode: Optional[int]
+    output: str
+    timed_out: bool = False
+    command_missing: bool = False
 
 
 @dataclass
@@ -23,260 +33,313 @@ class TestMethodResult:
 
 @dataclass
 class ExecutionResult:
-    status: str  # COMPILATION_ERROR / ASSERTION_FAILURE / RUNTIME_ERROR / ALL_PASSED
-    compile_errors: list = field(default_factory=list)
-    method_results: list = field(default_factory=list)  # list[TestMethodResult]
+    status: str
+    compile_errors: list[str] = field(default_factory=list)
+    method_results: list[TestMethodResult] = field(default_factory=list)
     raw_output: str = ""
+    returncode: Optional[int] = None
+    failure_phase: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class BuildAdapter:
+    def __init__(self, project_loc: str, timeout: int):
+        self.project_loc = project_loc
+        self.timeout = timeout
+
+    def compile(self) -> CommandResult:
+        raise NotImplementedError
+
+    def test(self, test_class_sig: str, method_name: Optional[str]) -> CommandResult:
+        raise NotImplementedError
+
+    def _run(self, command: list[str], timeout: Optional[int] = None) -> CommandResult:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.project_loc,
+                capture_output=True,
+                text=True,
+                timeout=timeout or self.timeout,
+            )
+            return CommandResult(result.returncode, result.stdout + "\n" + result.stderr)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
+            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+            return CommandResult(None, stdout + "\n" + stderr, timed_out=True)
+        except FileNotFoundError:
+            return CommandResult(None, f"Command not found: {command[0]}", command_missing=True)
+
+
+class MavenBuildAdapter(BuildAdapter):
+    def compile(self) -> CommandResult:
+        return self._run(["mvn", "-q", "-DskipTests", "test-compile"])
+
+    def test(self, test_class_sig: str, method_name: Optional[str]) -> CommandResult:
+        selector = test_class_sig if not method_name else f"{test_class_sig}#{method_name}"
+        return self._run(["mvn", "-q", "test", f"-Dtest={selector}"])
+
+
+class Defects4JBuildAdapter(BuildAdapter):
+    def compile(self) -> CommandResult:
+        return self._run(["defects4j", "compile"])
+
+    def test(self, test_class_sig: str, method_name: Optional[str]) -> CommandResult:
+        selector = test_class_sig if not method_name else f"{test_class_sig}::{method_name}"
+        return self._run(["defects4j", "test", "-t", selector])
+
+
+def select_build_adapter(project_loc: str, timeout: int) -> BuildAdapter:
+    if os.path.isfile(os.path.join(project_loc, "pom.xml")):
+        return MavenBuildAdapter(project_loc, timeout)
+    return Defects4JBuildAdapter(project_loc, timeout)
 
 
 class TestExecutor:
-    """Compiles and runs JUnit tests against a Java project."""
-
     def __init__(self, project_name: str, project_loc: str, test_loc: str):
         self.project_name = project_name
-        self.project_loc = project_loc  # e.g. data/project_under_test/Lang/Lang_1_buggy
-        self.test_loc = test_loc        # e.g. data/tmp_test (where generated tests are stored)
+        self.project_loc = os.path.abspath(project_loc)
+        self.test_loc = test_loc
+        timeout = int(CONFIG["pipeline"]["test_timeout_seconds"])
+        self.adapter = select_build_adapter(self.project_loc, timeout)
 
-    # ── compilation ──────────────────────────────────────────────────
+    def test_file_path(self, test_class_sig: str) -> str:
+        package_parts = test_class_sig.split(".")
+        relative = os.path.join(*package_parts[:-1], package_parts[-1] + ".java")
+        root = self.test_loc if os.path.isabs(self.test_loc) else os.path.join(self.project_loc, self.test_loc)
+        return os.path.join(root, relative)
+
+    def write_test(self, test_code: str, test_class_sig: str) -> str:
+        test_file = self.test_file_path(test_class_sig)
+        os.makedirs(os.path.dirname(test_file), exist_ok=True)
+        with open(test_file, "w", encoding="utf-8") as handle:
+            handle.write(test_code)
+        return test_file
 
     def compile_test(self, test_code: str, test_class_sig: str, test_subdir: str = "") -> tuple[bool, str]:
-        """Write test_code to a .java file and compile it against the project.
-        Returns (success, error_output).
-        """
-        # derive file path from signature: e.g. "org.apache.commons.lang3.math.NumberUtilsTest"
-        parts = test_class_sig.split(".")
-        file_name = parts[-1] + ".java"
-        if test_subdir:
-            test_dir = os.path.join(self.test_loc, test_subdir)
-        else:
-            test_dir = os.path.join(self.test_loc, self.project_name)
-        os.makedirs(test_dir, exist_ok=True)
-        test_file = os.path.join(test_dir, file_name)
-
-        with open(test_file, "w", encoding="utf-8") as f:
-            f.write(test_code)
-
-        # attempt Maven compile (if pom.xml exists), fall back to javac
-        compile_ok, compile_out = self._maven_compile(test_file, test_class_sig)
-        if compile_ok:
+        del test_subdir
+        self.write_test(test_code, test_class_sig)
+        result = self.adapter.compile()
+        if result.returncode == 0 and not result.timed_out:
             return True, ""
+        if result.timed_out:
+            return False, "Test compilation timed out\n" + result.output
+        return False, result.output
 
-        return False, compile_out
-
-    def _maven_compile(self, test_file: str, test_class_sig: str) -> tuple[bool, str]:
-        """Try Maven compile first. Returns (success, output)."""
-        pom = os.path.join(self.project_loc, "pom.xml")
-        if not os.path.exists(pom):
-            return False, "No pom.xml found, Maven compile not available"
-
-        # copy test file into project's test source tree
-        src_test = os.path.join(self.project_loc, "src", "test", "java")
-        pkg_path = test_class_sig.replace(".", os.sep)
-        dest_dir = os.path.join(src_test, os.path.dirname(pkg_path))
-        os.makedirs(dest_dir, exist_ok=True)
-        file_name = os.path.basename(test_file)
-        dest_file = os.path.join(dest_dir, file_name)
-        shutil.copy2(test_file, dest_file)
-
-        cmd = ["mvn", "test-compile", "-q", "-DskipTests"]
-        try:
-            result = subprocess.run(
-                cmd, cwd=self.project_loc,
-                capture_output=True, text=True, timeout=120
-            )
-            if result.returncode == 0:
-                return True, ""
-            return False, result.stderr + "\n" + result.stdout
-        except subprocess.TimeoutExpired:
-            return False, "Maven compile timed out"
-        except FileNotFoundError:
-            return False, "mvn command not found"
-
-    # ── execution ────────────────────────────────────────────────────
-
-    def run_test(self, test_class_sig: str, test_subdir: str = "") -> ExecutionResult:
-        """Run a single test class and parse JUnit results.
-        Returns ExecutionResult.
-        """
-        pom = os.path.join(self.project_loc, "pom.xml")
-        if not os.path.exists(pom):
+    def run_test(
+        self,
+        test_class_sig: str,
+        method_name: Optional[str] = None,
+        test_subdir: str = "",
+    ) -> ExecutionResult:
+        del test_subdir
+        started_at = time.time()
+        result = self.adapter.test(test_class_sig, method_name)
+        if result.timed_out:
             return ExecutionResult(
-                status="RUNTIME_ERROR",
-                raw_output="No pom.xml found"
+                status="TIMEOUT",
+                raw_output=result.output or "Test execution timed out",
+                returncode=result.returncode,
+                failure_phase="execution",
             )
-
-        # copy test file into project's test source tree if not already there
-        self._ensure_test_in_project(test_class_sig, test_subdir)
-
-        cmd = ["mvn", "test", "-q", f"-Dtest={test_class_sig}"]
-        try:
-            result = subprocess.run(
-                cmd, cwd=self.project_loc,
-                capture_output=True, text=True, timeout=120
-            )
-            output = result.stdout + "\n" + result.stderr
-            return self._parse_junit_output(output)
-        except subprocess.TimeoutExpired:
+        if result.command_missing:
             return ExecutionResult(
-                status="RUNTIME_ERROR",
-                raw_output="Test execution timed out"
+                status="UNKNOWN_ERROR",
+                raw_output=result.output,
+                returncode=result.returncode,
+                failure_phase="execution",
             )
-        except FileNotFoundError:
-            return ExecutionResult(
-                status="RUNTIME_ERROR",
-                raw_output="mvn command not found"
-            )
+        evidence = self._has_test_evidence(
+            result.output,
+            test_class_sig,
+            method_name,
+            started_at,
+        )
+        return self._parse_junit_output(
+            result.output,
+            result.returncode,
+            method_name or "",
+            has_test_evidence=evidence,
+        )
 
-    def _ensure_test_in_project(self, test_class_sig: str, test_subdir: str = ""):
-        """Copy the generated test file into the project's test source tree."""
-        parts = test_class_sig.split(".")
-        file_name = parts[-1] + ".java"
-        if test_subdir:
-            test_dir = os.path.join(self.test_loc, test_subdir)
-        else:
-            test_dir = os.path.join(self.test_loc, self.project_name)
-        src_file = os.path.join(test_dir, file_name)
-        if not os.path.exists(src_file):
-            return
-
-        dest_dir = os.path.join(self.project_loc, "src", "test", "java", os.sep.join(parts[:-1]))
-        os.makedirs(dest_dir, exist_ok=True)
-        shutil.copy2(src_file, os.path.join(dest_dir, file_name))
-
-    def _parse_junit_output(self, output: str) -> ExecutionResult:
-        """Parse Maven/JUnit output to determine test results."""
-        method_results: list[TestMethodResult] = []
-
-        # check for overall pass/fail
-        if "BUILD SUCCESS" in output:
-            # all tests passed
+    def _parse_junit_output(
+        self,
+        output: str,
+        returncode: Optional[int],
+        method_name: str = "",
+        has_test_evidence: Optional[bool] = None,
+    ) -> ExecutionResult:
+        if returncode == 0:
+            if has_test_evidence is None:
+                has_test_evidence = self._output_has_test_evidence(output)
+            if not has_test_evidence:
+                return ExecutionResult(
+                    status="UNKNOWN_ERROR",
+                    raw_output=output or "Command exited successfully but produced no test result",
+                    returncode=returncode,
+                    failure_phase="execution",
+                )
             return ExecutionResult(
                 status="ALL_PASSED",
-                method_results=method_results,
-                raw_output=output
+                method_results=[TestMethodResult(method_name=method_name, passed=True)] if method_name else [],
+                raw_output=output,
+                returncode=returncode,
             )
 
-        # look for assertion failures
-        # JUnit4 format: junit.framework.AssertionFailedError or java.lang.AssertionError
-        assertion_pattern = re.compile(
-            r"(?:junit\.framework\.AssertionFailedError|java\.lang\.AssertionError)"
-            r"(?::\s*(.*?))?(?:\n|$)",
-            re.IGNORECASE
-        )
-        # JUnit test method failure pattern
-        test_fail_pattern = re.compile(
-            r"Tests\s+run:\s+\d+,\s+Failures:\s+(\d+)"
-        )
-
-        # extract individual test results
-        test_result_pattern = re.compile(
-            r"^(.+?)\((.+?)\)\s+(Time elapsed:.*?)(.*)$",
-            re.MULTILINE
-        )
-
-        has_assertion_failure = False
-        has_runtime_error = False
-
-        # check for assertion failures
-        if assertion_pattern.search(output):
-            has_assertion_failure = True
-
-            # extract exception message and stack trace
-            exc_match = re.search(
-                r"(?:junit\.framework\.AssertionFailedError|java\.lang\.AssertionError)"
-                r"(?::\s*(.*?))?(?:\n|$)"
-                r"(.*?)(?:Tests run:|BUILD|$)",
-                output,
-                re.DOTALL | re.IGNORECASE
-            )
-            exc_message = ""
-            exc_stack = ""
-            if exc_match:
-                exc_message = exc_match.group(1) or ""
-                exc_stack = exc_match.group(2) or ""
-
-            # try to extract test method name
-            method_name = self._extract_failed_test_method(output)
-
-            method_results.append(TestMethodResult(
-                method_name=method_name,
-                passed=False,
-                exception_type="AssertionError",
-                exception_message=exc_message.strip(),
-                stack_trace=exc_stack.strip()
-            ))
-
-        # check for runtime errors (exceptions other than AssertionError)
-        runtime_exc_pattern = re.compile(
-            r"(?:java\.lang\.\w+Exception|java\.lang\.\w+Error)"
-            r"(?::\s*(.*?))?(?:\n|$)"
-        )
-        if not has_assertion_failure and runtime_exc_pattern.search(output):
-            has_runtime_error = True
-            exc_match = re.search(
-                r"(java\.lang\.\w+(?:Exception|Error))"
-                r"(?::\s*(.*?))?(?:\n|$)"
-                r"(.*?)(?:Tests run:|BUILD|$)",
-                output,
-                re.DOTALL
-            )
-            if exc_match:
-                exc_type = exc_match.group(1)
-                exc_message = exc_match.group(2) or ""
-                exc_stack = exc_match.group(3) or ""
-                method_name = self._extract_failed_test_method(output)
-
-                method_results.append(TestMethodResult(
-                    method_name=method_name,
-                    passed=False,
-                    exception_type=exc_type,
-                    exception_message=exc_message.strip(),
-                    stack_trace=exc_stack.strip()
-                ))
-
-        # if BUILD FAILURE but no specific exception found
-        if "BUILD FAILURE" in output and not method_results:
+        if returncode is None:
             return ExecutionResult(
-                status="RUNTIME_ERROR",
-                raw_output=output
+                status="UNKNOWN_ERROR",
+                raw_output=output,
+                returncode=returncode,
+                failure_phase="execution",
             )
 
-        if has_assertion_failure:
+        if self._looks_like_compilation_error(output):
+            return ExecutionResult(
+                status="COMPILATION_ERROR",
+                compile_errors=self._extract_compilation_errors(output),
+                raw_output=output,
+                returncode=returncode,
+                failure_phase="compilation",
+            )
+
+        assertion_match = re.search(
+            r"((?:org\.opentest4j\.)?AssertionFailedError|junit\.framework\.AssertionFailedError|java\.lang\.AssertionError)"
+            r"(?::\s*([^\r\n]*))?",
+            output,
+            re.IGNORECASE,
+        )
+        if assertion_match:
+            failed_method = self._extract_failed_test_method(output) or method_name
+            method_result = TestMethodResult(
+                method_name=failed_method,
+                passed=False,
+                exception_type=assertion_match.group(1),
+                exception_message=(assertion_match.group(2) or "").strip(),
+                stack_trace=self._extract_stack_trace(output),
+            )
             return ExecutionResult(
                 status="ASSERTION_FAILURE",
-                method_results=method_results,
-                raw_output=output
+                method_results=[method_result],
+                raw_output=output,
+                returncode=returncode,
+                failure_phase="assertion",
             )
-        elif has_runtime_error:
+
+        runtime_match = re.search(
+            r"((?:[A-Za-z_$][\w$]*\.)+(?:\w+Exception|\w+Error))(?::\s*([^\r\n]*))?",
+            output,
+        )
+        if runtime_match:
+            failed_method = self._extract_failed_test_method(output) or method_name
             return ExecutionResult(
                 status="RUNTIME_ERROR",
-                method_results=method_results,
-                raw_output=output
-            )
-        else:
-            return ExecutionResult(
-                status="ALL_PASSED",
-                method_results=method_results,
-                raw_output=output
+                method_results=[TestMethodResult(
+                    method_name=failed_method,
+                    passed=False,
+                    exception_type=runtime_match.group(1),
+                    exception_message=(runtime_match.group(2) or "").strip(),
+                    stack_trace=self._extract_stack_trace(output),
+                )],
+                raw_output=output,
+                returncode=returncode,
+                failure_phase="execution",
             )
 
-    def _extract_failed_test_method(self, output: str) -> str:
-        """Extract the name of the failed test method from JUnit output."""
-        # Pattern: at org.example.MyTest.testMethod(MyTest.java:42)
-        match = re.search(r"at\s+([\w.]+)\.(\w+)\([^)]+\.java:\d+\)", output)
-        if match:
-            return match.group(2)
+        return ExecutionResult(
+            status="UNKNOWN_ERROR",
+            raw_output=output,
+            returncode=returncode,
+            failure_phase="execution",
+        )
+
+    @staticmethod
+    def _output_has_test_evidence(output: str) -> bool:
+        return bool(re.search(
+            r"(?:Tests run:\s*\d+|Failing tests:\s*\d+|test result:\s*(?:ok|FAILED))",
+            output,
+            re.IGNORECASE,
+        ))
+
+    def _has_test_evidence(
+        self,
+        output: str,
+        test_class_sig: str,
+        method_name: Optional[str],
+        started_at: float,
+    ) -> bool:
+        if self._output_has_test_evidence(output):
+            return True
+        report_pattern = os.path.join(self.project_loc, "**", "surefire-reports", "TEST-*.xml")
+        for report in glob.glob(report_pattern, recursive=True):
+            try:
+                if os.path.getmtime(report) + 1 < started_at:
+                    continue
+                root = ET.parse(report).getroot()
+            except (OSError, ET.ParseError):
+                continue
+            testcases = root.findall(".//testcase")
+            for testcase in testcases:
+                class_name = testcase.get("classname", "")
+                name = testcase.get("name", "")
+                if class_name != test_class_sig:
+                    continue
+                if method_name is None or name == method_name or name.startswith(method_name + "["):
+                    return True
+        return False
+
+    @staticmethod
+    def _looks_like_compilation_error(output: str) -> bool:
+        lowered = output.lower()
+        return any(marker in lowered for marker in (
+            "compilation failure",
+            "compilation error",
+            "cannot find symbol",
+            "incompatible types",
+            "compiler.err.",
+        ))
+
+    @staticmethod
+    def _extract_compilation_errors(output: str) -> list[str]:
+        lines = []
+        for line in output.splitlines():
+            lowered = line.lower()
+            if "error" in lowered or "cannot find symbol" in lowered or "incompatible types" in lowered:
+                lines.append(line.strip())
+        return lines[:20] or [output[-2000:]]
+
+    @staticmethod
+    def _extract_failed_test_method(output: str) -> str:
+        patterns = (
+            r"at\s+[\w.$]+\.(\w+)\([^)]+\.java:\d+\)",
+            r"(?:test)?([A-Za-z_$][\w$]*)\([^)]*\)\s+Time elapsed",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, output)
+            if match:
+                return match.group(1)
         return ""
 
-    # ── combined diagnostic flow ─────────────────────────────────────
+    @staticmethod
+    def _extract_stack_trace(output: str) -> str:
+        stack_lines = [line for line in output.splitlines() if line.lstrip().startswith("at ")]
+        return "\n".join(stack_lines[:30])
 
-    def diagnose(self, test_code: str, test_class_sig: str, test_subdir: str = "") -> ExecutionResult:
-        """Full pipeline: compile then run. Returns ExecutionResult."""
-        compile_ok, compile_err = self.compile_test(test_code, test_class_sig, test_subdir)
+    def diagnose(
+        self,
+        test_code: str,
+        test_class_sig: str,
+        method_name: Optional[str] = None,
+        test_subdir: str = "",
+    ) -> ExecutionResult:
+        compile_ok, compile_error = self.compile_test(test_code, test_class_sig, test_subdir)
         if not compile_ok:
             return ExecutionResult(
                 status="COMPILATION_ERROR",
-                compile_errors=[compile_err],
-                raw_output=compile_err
+                compile_errors=self._extract_compilation_errors(compile_error),
+                raw_output=compile_error,
+                failure_phase="compilation",
             )
-        return self.run_test(test_class_sig, test_subdir)
+        return self.run_test(test_class_sig, method_name, test_subdir)

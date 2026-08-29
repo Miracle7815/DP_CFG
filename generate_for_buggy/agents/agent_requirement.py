@@ -2,10 +2,12 @@
 import json
 import os
 import re
-from copy import deepcopy
-from ..config import logger
+from ..config import CONFIG, logger
 from ..basic_class.llm_message import MessageThread, FunctionCall, ContextManager
+from ..contracts import assert_public_coverage_goal, validate_scenario, validate_scenario_file
 from ..models import model
+from ..privacy import validate_and_record_prompt
+from ..utils.public_api import class_skeleton, is_visible_declaration, sanitise_field_declaration
 from .agent_reviewer import ReviewAgent
 
 SYSTEM_PROMPT = '''You are an experienced software test engineer specialized in test scenario analysis. Your task is to analyze a Java method and gather the necessary code context for generating test scenarios.'''
@@ -25,8 +27,7 @@ You should use tools to retrieve the definition of what you need.
 ### Available Tools:
 - `search_class_skeleton(class_name)`: Get class structure (fields + method signatures, no method bodies)
 - `search_method_contract(class_name, method_name)`: Get signature and javadoc of a called method. ONLY call this when a specific called method's semantics (what it returns, side effects, or special behavior) are needed to understand the target method's behavior. Do NOT call this for obvious standard operations or methods whose intent is already clear from their name.
-- `search_field_definition(class_name, field_name)`: Get field definition
-- `search_use_examples()`: Find local code snippets where the method under test is called by other methods in the project
+- `search_field_definition(class_name, field_name)`: Get a declaration without its initializer
 - `search_called_methods()`: Get the list of all method signatures called by the target method under test
 
 ### Output Format:
@@ -79,12 +80,14 @@ Output a JSON object with:
 
 Each scenario must have:
 - id: Unique identifier (S1, S2, ...)
+- origin: Always "initial"
 - category: One of "normal_path", "boundary", "edge_case", "suspicious"
 - description: What this scenario tests
 - input_constraints: Description of characteristic constraints on the input — describe the properties, types, ranges, and conditions the input must satisfy. Use only abstract descriptions of properties. Do NOT provide concrete example values.
 - expected_behavior_constraints: Description of characteristic constraints on the expected behavior — describe what SHOULD happen given inputs matching the input constraints, in terms of observable properties, return value characteristics, or exception types. Do NOT provide concrete example values.
-- rationale: Why this scenario is needed (which javadoc rule it covers)
+- oracle_basis: The javadoc clause or public contract supporting the expected behavior
 - priority: "high", "medium", or "low"
+- status: Always "draft"
 
 Scenario categories:
 - normal_path: Normal behavior explicitly described in javadoc
@@ -108,12 +111,14 @@ You MUST output ONLY a valid JSON object enclosed in ```json ... ``` code blocks
     "test_scenarios": [
         {
             "id": "S1",
+            "origin": "initial",
             "category": "normal_path",
             "description": "...",
             "input_constraints": "...",
             "expected_behavior_constraints": "...",
-            "rationale": "...",
-            "priority": "high"
+            "oracle_basis": "...",
+            "priority": "high",
+            "status": "draft"
         }
     ]
 }
@@ -144,12 +149,15 @@ Output the COMPLETE, CORRECTED test scenarios file with the following structure:
 
 Each scenario must have:
 - id: Unique identifier (S1, S2, ...) — preserve original IDs for unmodified scenarios
+- origin: Preserve "initial" or "coverage"
 - category: One of "normal_path", "boundary", "edge_case", "suspicious"
 - description: What this scenario tests
 - input_constraints: Description of characteristic constraints on the input — abstract properties only, NO concrete example values
 - expected_behavior_constraints: Description of characteristic constraints on the expected behavior — abstract properties only, NO concrete example values
-- rationale: Why this scenario is needed (which javadoc rule or reviewer suggestion it addresses)
+- oracle_basis: Javadoc clause or public contract supporting the expectation
 - priority: "high", "medium", or "low"
+- coverage_goal_id: Required only when origin is "coverage"
+- status: "draft" while under review
 
 Output Format:
 You MUST output ONLY a valid JSON object enclosed in ```json ... ``` code blocks. Do NOT include any explanatory text, analysis, or additional content outside the JSON object.
@@ -167,22 +175,21 @@ You MUST output ONLY a valid JSON object enclosed in ```json ... ``` code blocks
 
 COVERAGE_SUPPLEMENT_PROMPT = '''You are generating additional test scenarios to improve code coverage.
 
-You will be given:
-- Existing test scenarios
-- Uncovered branch conditions from the control flow graph
-- Method signature and javadoc
+You will be given existing scenarios, a source-free CoverageGoal, the method signature, and javadoc.
 
 Task: Generate NEW test scenarios that would exercise the uncovered branch conditions.
 
-For each uncovered branch condition:
-1. Analyze what input conditions would make the branch evaluate to the opposite direction
-2. Generate a new scenario with type "edge_case" or "suspicious"
-3. Clearly mark the rationale as coverage-driven
+The CoverageGoal contains only opaque path identifiers and symbolic input relations. Do not guess hidden
+constants, source statements, or concrete values. If public documentation provides a testable oracle, use it.
+If no public oracle exists but the goal is constructible, generate one temporary coverage probe with
+oracle_basis="coverage_probe_only" and expected_behavior_constraints stating only that the target is invoked;
+never invent an expected return value or exception for a probe.
 
 Output only NEW scenarios as a JSON array.
-Each scenario must have: id, type, description, input_constraints, expected_behavior_constraints, rationale, priority.'''
+Each scenario must have: id, origin="coverage", category, description, input_constraints,
+expected_behavior_constraints, oracle_basis, priority, coverage_goal_id, status="draft".'''
 
-BASE_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'results', 'detailed_res_info')
+BASE_PATH = CONFIG['json_res_dir']
 
 
 class RequirementAgent:
@@ -192,8 +199,13 @@ class RequirementAgent:
         self.class_map = class_map
         self.method_map = method_map
 
-        self.context_request_memory = []
+        self.context_requests = []
         self.target_method = None
+
+    def _call_model(self, messages, **kwargs):
+        validate_and_record_prompt(messages, "requirement", self.target_method)
+        selected = model.require_model(model.SELECTED_MODEL, "selected")
+        return selected.call(messages, **kwargs)
 
     # ── Tool Implementations ──────────────────────────────────────────
 
@@ -202,62 +214,18 @@ class RequirementAgent:
             if classs_name == class_name:
                 for field, statement in classs.fields.items():
                     if field == field_name:
-                        return statement
+                        if not is_visible_declaration(statement):
+                            return None
+                        return sanitise_field_declaration(statement)
         return None
 
     def search_use_example(self):
-        """Extract local code snippets around the call site using tree-sitter AST.
-
-        Returns up to 3 short code excerpts containing the call.
-        """
-        from tree_sitter_languages import get_language, get_parser
-
-        language = get_language("java")
-        parser = get_parser("java")
-
+        """Return caller signatures only; source snippets never cross the LLM boundary."""
         results = []
         for method in self.method_map.values():
             for method_info in method.called_method_site:
                 if method_info[0] == self.target_method.name and method_info[1] == tuple(self.target_method.parameters_list):
-                    call_line = method_info[2]  # 0-indexed line number in method.content
-
-                    # Parse the method body to find the statement containing the call
-                    code_bytes = method.content.encode("utf-8", errors="replace")
-                    tree = parser.parse(code_bytes)
-
-                    lines = method.content.split("\n")
-
-                    def find_statement_at_line(node, target):
-                        for child in node.children:
-                            if target < child.start_point[0] or target > child.end_point[0]:
-                                continue
-                            if child.type in ("expression_statement", "if_statement", "while_statement",
-                                            "for_statement", "do_statement", "return_statement",
-                                            "variable_declaration", "local_variable_declaration",
-                                            "enhanced_for_statement", "try_with_resources_statement"):
-                                return child
-                            result = find_statement_at_line(child, target)
-                            if result is not None:
-                                return result
-                        return None
-
-                    stmt_node = find_statement_at_line(tree.root_node, call_line)
-
-                    if stmt_node:
-                        context_lines = []
-                        for i in range(max(0, stmt_node.start_point[0] - 2), min(len(lines), stmt_node.end_point[0] + 3)):
-                            prefix = ">>> " if i == call_line else "    "
-                            context_lines.append(f"{prefix}{lines[i]}")
-                        snippet = "\n".join(context_lines)
-                    else:
-                        # Fallback: show the call line with 2 lines of context
-                        context_lines = []
-                        for i in range(max(0, call_line - 2), min(len(lines), call_line + 3)):
-                            prefix = ">>> " if i == call_line else "    "
-                            context_lines.append(f"{prefix}{lines[i]}")
-                        snippet = "\n".join(context_lines)
-
-                    results.append(snippet)
+                    results.append({"caller_signature": method.signature})
                     if len(results) >= 3:
                         return results
         return results
@@ -267,7 +235,11 @@ class RequirementAgent:
         for classs_name, classs in self.class_map.items():
             if classs_name == class_name:
                 for method in classs.methods:
-                    if method.name_no_package == method_name and method in self.target_method.called_methods:
+                    if (
+                        method.name_no_package == method_name
+                        and method in self.target_method.called_methods
+                        and is_visible_declaration(method.content)
+                    ):
                         javadoc = method.javadoc if method.javadoc else "No javadoc available."
                         result.append({"signature": method.signature, "javadoc": javadoc})
                 break
@@ -286,23 +258,10 @@ class RequirementAgent:
         return results
 
     def search_class_skeleton(self, class_name):
-        skeleton_str = ""
         for classs_name, classs in self.class_map.items():
             if classs_name == class_name:
-                skeleton_str += classs.signature + "\n"
-                skeleton_str += '   -Fields:\n'
-                for class_field, statement in classs.fields.items():
-                    skeleton_str += f"      {statement}\n"
-                skeleton_str += '   -Constructors:\n'
-                for constructor in classs.constructor:
-                    skeleton_str += f"      {constructor.signature}\n"
-                skeleton_str += '   -Methods:\n'
-                for method in classs.methods:
-                    skeleton_str += f"      {method.signature}\n"
-                break
-        if skeleton_str == "":
-            skeleton_str = "Class not found"
-        return skeleton_str
+                return class_skeleton(classs)
+        return "Class not found"
 
     def _extract_analysis_text(self, response: str) -> str:
         """Extract the analysis text that appears before the JSON block in the response."""
@@ -356,7 +315,7 @@ class RequirementAgent:
         is added via thread.add_model() as role='assistant'.
         """
         self.target_method = target_method
-        self.context_request_memory = []
+        self.context_requests = []
 
         javadoc = target_method.javadoc if target_method.javadoc is not None else "No Java doc"
         import_string = ""
@@ -382,10 +341,10 @@ class RequirementAgent:
         )
         thread.add_user(user_prompt)
 
-        logger.info(f"RequirementAgent - Context Collection Prompt:\n{thread.to_msg()}")
+        logger.info("RequirementAgent - submitting source-free context collection prompt")
 
-        response, *_ = model.SELECTED_MODEL.call(thread.to_msg())
-        logger.info(f"RequirementAgent - Context Collection Response:\n{response}")
+        response = self._call_model(thread.to_msg()).content
+        logger.info(f"RequirementAgent - context collection response received ({len(response)} chars)")
 
         tool_id = 0
         for try_num in range(max_turns):
@@ -454,10 +413,10 @@ class RequirementAgent:
                     else:
                         full_results.append(f"### Tool Error\nTool '{tool_name}' not found.")
 
-                    # Track in memory
+                    # Track tool calls for this single generation run only.
                     fc = FunctionCall(tool_id, tool_name, args)
                     fc.set_result(" (stored in ContextManager)", True)
-                    self.context_request_memory.append(fc)
+                    self.context_requests.append(fc)
                     tool_id += 1
 
                 # Add model analysis + full tool results as assistant + user messages
@@ -475,9 +434,9 @@ class RequirementAgent:
                 )
                 thread.add_user(user_summary)
 
-            logger.info(f"RequirementAgent - Context Collection Prompt:\n{thread.to_msg()}")
-            response, *_ = model.SELECTED_MODEL.call(thread.to_msg())
-            logger.info(f"RequirementAgent - Context Collection Response:\n{response}")
+            logger.info("RequirementAgent - submitting next source-free context collection turn")
+            response = self._call_model(thread.to_msg()).content
+            logger.info(f"RequirementAgent - context collection response received ({len(response)} chars)")
 
     # ── Phase 2: Initial Scenario Generation ─────────────────────────
 
@@ -507,15 +466,16 @@ class RequirementAgent:
         )
         thread.add_user(user_prompt)
 
-        logger.info(f"RequirementAgent - Scenario Generation Prompt:\n{thread.to_msg()}")
+        logger.info("RequirementAgent - submitting initial scenario prompt")
 
         for retry in range(5):
-            response, _, _, _, reason = model.SELECTED_MODEL.call(thread.to_msg() , temperature=0.4)
-            if reason == 'length':
+            model_response = self._call_model(thread.to_msg(), temperature=0.4)
+            response = model_response.content
+            if model_response.finish_reason == 'length':
                 logger.info("Retry scenario generation due to length limit")
                 continue
 
-            logger.info(f"RequirementAgent - Scenario Generation Response:\n{response}")
+            logger.info(f"RequirementAgent - scenario response received ({len(response)} chars)")
             scenario_data = self._extract_scenario_json(response)
             if scenario_data is not None:
                 return scenario_data
@@ -526,43 +486,63 @@ class RequirementAgent:
 
     def _extract_scenario_json(self, response: str) -> dict | None:
         """Extract the scenario JSON from LLM response."""
+        data = None
         pattern = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
         match = pattern.search(response)
         if match:
             try:
-                return json.loads(match.group(1))
+                data = json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-        pattern2 = re.compile(r"\{[\s\S]*\}", re.DOTALL)
-        match2 = pattern2.search(response)
-        if match2:
+        if data is None:
+            pattern2 = re.compile(r"\{[\s\S]*\}", re.DOTALL)
+            match2 = pattern2.search(response)
+        else:
+            match2 = None
+        if data is None and match2:
             try:
-                return json.loads(match2.group(0))
+                data = json.loads(match2.group(0))
             except json.JSONDecodeError:
                 pass
-        return None
+        if data is None:
+            return None
+        issues = validate_scenario_file(data)
+        if issues:
+            logger.warning("Scenario contract validation failed: " + "; ".join(issues))
+            return None
+        return data
 
     def _extract_json_array(self, response: str) -> list:
         """Extract a JSON array from response."""
+        data = None
         pattern = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
         match = pattern.search(response)
         if match:
             try:
-                return json.loads(match.group(1))
+                data = json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
         pattern2 = re.compile(r"\[\s*\{.*\}\s*\]", re.DOTALL)
-        match2 = pattern2.search(response)
-        if match2:
+        match2 = pattern2.search(response) if data is None else None
+        if data is None and match2:
             try:
-                return json.loads(match2.group(0))
+                data = json.loads(match2.group(0))
             except json.JSONDecodeError:
                 pass
-        return []
+        if not isinstance(data, list):
+            return []
+        issues = []
+        for scenario in data:
+            issues.extend(validate_scenario(scenario))
+        if issues:
+            logger.warning("Supplement scenario contract validation failed: " + "; ".join(issues))
+            return []
+        return data
 
     # ── Phase 3: Reviewer Iteration ──────────────────────────────────
 
-    def iterate_with_reviewer(self, scenario_data: dict, max_rounds=5) -> dict:
+    def iterate_with_reviewer(self, scenario_data: dict, max_rounds=3,
+                              expected_origin: str | None = None) -> dict:
         """Submit scenarios to ReviewerAgent for audit, iterate until approved or max rounds."""
         review_agent = ReviewAgent('scenario')
         review_agent.set_up(self.all_packages, self.class_map, self.method_map)
@@ -578,11 +558,10 @@ class RequirementAgent:
                 javadoc=javadoc,
             )
 
-            if review_result is None:
-                break
-
-            if review_result.get('result', 'Yes').strip() == "Yes":
+            if review_result.get('result', 'No').strip() == "Yes":
                 logger.info(f"Scenario review passed at round {round_idx + 1}")
+                for scenario in scenario_data.get("test_scenarios", []):
+                    scenario["status"] = "approved"
                 return scenario_data
 
             # Review rejected — generate corrected scenarios
@@ -635,46 +614,38 @@ class RequirementAgent:
             )
             thread.add_user(user_prompt)
 
-            logger.info(f"RequirementAgent - Scenario Correction Prompt:\n{thread.to_msg()}")
-            response, _, _, _, reason = model.SELECTED_MODEL.call(thread.to_msg())
+            logger.info("RequirementAgent - submitting scenario correction prompt")
+            model_response = self._call_model(thread.to_msg())
+            response = model_response.content
 
-            if reason == 'length':
+            if model_response.finish_reason == 'length':
                 logger.info("Retry due to length limit during correction")
                 continue
 
-            logger.info(f"RequirementAgent - Scenario Correction Response:\n{response}")
+            logger.info(f"RequirementAgent - scenario correction response received ({len(response)} chars)")
             new_data = self._extract_scenario_json(response)
             if new_data is not None:
+                origin_issues = validate_scenario_file(new_data, expected_origin)
+                if origin_issues:
+                    logger.warning("Reviewer revision changed scenario origin: " + "; ".join(origin_issues))
+                    continue
                 scenario_data = new_data
                 group = self.project_name.split('_')[0]
                 dir_path = os.path.join(BASE_PATH, group, self.project_name)
                 save_to_file(dir_path, 'test_scenarios.json', json.dumps(scenario_data, indent=4))
 
+        for scenario in scenario_data.get("test_scenarios", []):
+            scenario["status"] = "rejected"
         return scenario_data
 
     # ── Phase 4: Coverage-Driven Scenario Supplementation ─────────────
 
     def generate_supplement_scenarios(self, existing_scenarios: dict,
-                                       branch_conditions: list,
+                                       coverage_goal: dict,
                                        max_rounds=3) -> dict:
-        """Generate new scenarios based on uncovered branch conditions from the best path.
-
-        Since the model does NOT know the source code, we only provide:
-        - The branch conditions (statement + conditional direction) from the best path
-        - Method signature + javadoc
-        - Existing scenarios
-
-        Returns the updated scenario dict.
-        """
+        """Generate reviewed scenarios from a source-free CoverageGoal."""
+        assert_public_coverage_goal(coverage_goal)
         javadoc = self.target_method.javadoc if self.target_method.javadoc is not None else "No Java doc"
-
-        # Build branch conditions message (no line numbers, no source code)
-        branch_msg = ""
-        for bc in branch_conditions:
-            branch_msg += (
-                f"  - Statement: {bc.get('statement', '')}\n"
-                f"    Conditional: {bc.get('conditional', '')}\n"
-            )
 
         thread = MessageThread()
         thread.add_system(SCENARIO_GENERATION_SYSTEM)
@@ -684,18 +655,19 @@ class RequirementAgent:
             f"  Signature: {self.target_method.signature}\n"
             f"  Javadoc: {javadoc}\n\n"
             f"Existing Scenarios:\n{json.dumps(existing_scenarios.get('test_scenarios', []), indent=2)}\n\n"
-            f"Uncovered Branch Conditions:\n{branch_msg}\n\n"
+            f"Source-free CoverageGoal:\n{json.dumps(coverage_goal, indent=2)}\n\n"
             f"{COVERAGE_SUPPLEMENT_PROMPT}"
         )
         thread.add_user(user_prompt)
 
-        logger.info(f"RequirementAgent - Coverage Supplement Prompt:\n{thread.to_msg()}")
-        response, _, _, reason = model.SELECTED_MODEL.call(thread.to_msg())
+        logger.info("RequirementAgent - submitting source-free coverage supplement prompt")
+        model_response = self._call_model(thread.to_msg())
+        response = model_response.content
 
-        if reason == 'length':
+        if model_response.finish_reason == 'length':
             return existing_scenarios
 
-        logger.info(f"RequirementAgent - Coverage Supplement Response:\n{response}")
+        logger.info(f"RequirementAgent - coverage supplement response received ({len(response)} chars)")
 
         # Extract new scenarios
         new_scenarios = self._extract_json_array(response)
@@ -703,28 +675,21 @@ class RequirementAgent:
             logger.info("No new scenarios generated from coverage analysis")
             return existing_scenarios
 
-        # Review new scenarios
-        review_agent = ReviewAgent('scenario')
-        review_agent.set_up(self.all_packages, self.class_map, self.method_map)
-
         supplement_file = {
             "method_intent": existing_scenarios.get("method_intent", ""),
             "input_output_spec": existing_scenarios.get("input_output_spec", {}),
             "test_scenarios": new_scenarios
         }
+        supplement_file = self.iterate_with_reviewer(
+            supplement_file,
+            max_rounds=max_rounds,
+            expected_origin="coverage",
+        )
 
-        for round_idx in range(max_rounds):
-            review_result = review_agent.review_test_scenarios(
-                scenario_file=supplement_file,
-                method_signature=self.target_method.signature,
-                javadoc=javadoc,
-            )
-            if review_result is None or review_result.get('result', 'Yes').strip() == "Yes":
-                break
-
-        # Append new scenarios to existing
         existing_ids = {s["id"] for s in existing_scenarios.get("test_scenarios", [])}
-        for s in new_scenarios:
+        for s in supplement_file.get("test_scenarios", []):
+            if s.get("status") != "approved":
+                continue
             if s["id"] not in existing_ids:
                 existing_scenarios.setdefault("test_scenarios", []).append(s)
                 existing_ids.add(s["id"])
@@ -749,7 +714,11 @@ class RequirementAgent:
         save_to_file(dir_path, 'test_scenarios.json', json.dumps(scenario_data, indent=4))
 
         logger.info("========= Stage 3: Reviewer iteration =========")
-        scenario_data = self.iterate_with_reviewer(scenario_data)
+        scenario_data = self.iterate_with_reviewer(
+            scenario_data,
+            max_rounds=CONFIG["pipeline"]["scenario_review_retries"],
+            expected_origin="initial",
+        )
 
         # Save to file
         group = self.project_name.split('_')[0]

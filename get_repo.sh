@@ -4,9 +4,11 @@
 # 你可以先用一两个项目测试: PROJECTS=("Lang" "Chart")
 PROJECTS=("Cli" "Codec" "Collections" "Compress" "Csv" "Gson" "JacksonCore" "JacksonDatabind" "JacksonXml" "Jsoup" "JxPath" "Lang" "Math" "Time")
 
-# 定义一个基础工作目录，所有代码都将检出到这里
-BASE_BUGGY_DIR="/home/miracle/DP_CFG/project_under_test"
-BASE_FIXED_DIR="/home/miracle/DP_CFG/project_fixed"
+# 所有路径都可以通过环境变量覆盖。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BASE_BUGGY_DIR="${DP_CFG_BUGGY_ROOT:-$SCRIPT_DIR/data/project_under_test}"
+BASE_FIXED_DIR="${DP_CFG_FIXED_ROOT:-$SCRIPT_DIR/data/project_fixed}"
+DEFECTS4J_BIN="${DEFECTS4J_BIN:-defects4j}"
 
 # 确保基础目录存在
 mkdir -p "$BASE_BUGGY_DIR"
@@ -19,7 +21,7 @@ for project in "${PROJECTS[@]}"; do
   echo "=================================================="
 
   # 获取该项目的所有bug ID列表
-  bug_ids=$(/home/miracle/Panta/defects4j/framework/bin/defects4j query -p "$project" -q "bug.id")
+  bug_ids=$("$DEFECTS4J_BIN" query -p "$project" -q "bug.id")
 
   # 遍历该项目的所有bug
   for bug_id in $bug_ids; do
@@ -35,11 +37,11 @@ for project in "${PROJECTS[@]}"; do
 
     # 检出缺陷版本
     echo "     - Buggy version to $buggy_dir"
-    /home/miracle/Panta/defects4j/framework/bin/defects4j checkout -p "$project" -v "$buggy_version_id" -w "$buggy_dir"
+    "$DEFECTS4J_BIN" checkout -p "$project" -v "$buggy_version_id" -w "$buggy_dir"
 
     # 检出修复版本
     echo "     - Fixed version to $fixed_dir"
-    /home/miracle/Panta/defects4j/framework/bin/defects4j checkout -p "$project" -v "$fixed_version_id" -w "$fixed_dir"
+    "$DEFECTS4J_BIN" checkout -p "$project" -v "$fixed_version_id" -w "$fixed_dir"
 
     echo "  -> Done with $project-$bug_id."
     echo ""

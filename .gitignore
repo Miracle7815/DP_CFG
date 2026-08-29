@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+target/
+build/
+.gradle/
+
+# Generated results
+/result/
+/results/
+/analyse_result/
+
+# Local data
+/data/
+/data_info/
+
+# Environment files and virtual environments
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+/.venv/
+/venv/
+/env/
+/ENV/

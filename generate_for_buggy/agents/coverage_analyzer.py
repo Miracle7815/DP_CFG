@@ -1,288 +1,543 @@
-"""
-CoverageAnalyzer - Collects JaCoCo coverage, updates target_method.missed_lines
-and missed_braches, uses cfg_info.paths + line_number_to_node_id mapping to
-find the best uncovered path for generating new test scenarios.
-"""
+"""Method-precise JaCoCo coverage and source-free coverage goal production."""
+
+from __future__ import annotations
+
+import glob
 import os
 import subprocess
+import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from typing import Optional
 
-from ..config import logger
+from ..config import CONFIG, logger
+from .branch_trace import BranchTraceCollector
+from .symbolic_coverage import CoverageSanitizer, SymbolicPathBuilder, WitnessBinder
+
+
+@dataclass
+class _GoalBaseline:
+    target_lines: tuple[int, ...]
+    covered_branches: int
+    missed_branches: int
+    target_key: tuple
 
 
 class CoverageAnalyzer:
-    """Runs JaCoCo coverage and extracts per-method coverage using cfg_info.paths."""
-
-    def __init__(self, project_name: str, project_loc: str, src_loc: str):
+    def __init__(self, project_name: str, project_loc: str, src_loc: str, test_loc: Optional[str] = None):
         self.project_name = project_name
-        self.project_loc = project_loc
+        self.project_loc = os.path.abspath(project_loc)
         self.src_loc = src_loc
-
-    def collect_and_update(self, target_method, test_class_sig: str) -> dict:
-        """Run JaCoCo tests, parse coverage, update target_method fields,
-        and find the best path for generating new test scenarios.
-
-        Returns:
-            {
-                "line_coverage_pct": float,
-                "branch_coverage_pct": float,
-                "missed_lines": [int, ...],
-                "best_path": {
-                    "path_nodes": [...],          # nodes in the best path
-                    "branch_conditions": [...],   # {"line": int, "statement": str, "conditional": str}
-                },
-            }
-        """
-        # Step 1: run JaCoCo and parse coverage (line + branch counters)
-        line_covered, line_missed, branch_covered, branch_missed = \
-            self._run_jacoco(test_class_sig, target_method)
-
-        # Step 2: compute covered/missed lines using node_id_to_line_number mapping
-        covered_lines, missed_lines_set = self._map_coverage_to_lines(
-            target_method, line_covered, line_missed
+        self.symbolic_builder = SymbolicPathBuilder()
+        self.sanitizer = CoverageSanitizer()
+        self.witness_binder = WitnessBinder()
+        self.trace_collector = BranchTraceCollector(
+            project_name,
+            self.project_loc,
+            src_loc,
+            test_loc or CONFIG["mappings"]["test"],
         )
+        self.private_formulas = {}
+        self.public_goals = {}
+        self.goal_baselines: dict[str, _GoalBaseline] = {}
+        self.attempted_targets: set[tuple] = set()
+        self._last_coverage = None
+        self._jacoco_diagnostic = ""
 
-        target_method.missed_lines = missed_lines_set
+    def collect_and_update(
+        self,
+        target_method,
+        test_class_sig: str,
+        seed_scenario_id: Optional[str] = None,
+        scenario_methods: Optional[dict[str, str]] = None,
+    ) -> dict:
+        coverage = self._collect_jacoco(target_method, test_class_sig)
+        if coverage["status"] != "ok":
+            return {
+                "status": coverage["status"],
+                "diagnostic": coverage.get("diagnostic", ""),
+                "line_coverage_pct": 0.0,
+                "branch_coverage_pct": 0.0,
+                "covered_lines": [],
+                "missed_lines": [],
+                "coverage_goal": None,
+            }
 
-        # Step 3: use cfg_info.paths to find the path covering the most missed lines
-        best_path_info = self._find_best_path(target_method, missed_lines_set)
+        self._last_coverage = coverage
+        covered_lines = {
+            line for line, counts in coverage["lines"].items() if counts["covered_instructions"] > 0
+        }
+        missed_lines = {
+            line for line, counts in coverage["lines"].items() if counts["missed_instructions"] > 0
+        }
+        target_method.covered_lines = covered_lines
+        target_method.missed_lines = missed_lines
 
-        # update missed branches from best path's branch conditions
-        missed_branches_set = set()
-        if best_path_info:
-            for bc in best_path_info["branch_conditions"]:
-                missed_branches_set.add((bc["line"], bc["conditional"]))
-        target_method.missed_braches = missed_branches_set
+        line_counter = coverage["counters"].get("LINE", {"covered": 0, "missed": 0})
+        branch_counter = coverage["counters"].get("BRANCH", {"covered": 0, "missed": 0})
+        line_total = line_counter["covered"] + line_counter["missed"]
+        branch_total = branch_counter["covered"] + branch_counter["missed"]
 
-        # Step 4: compute coverage percentages
-        total_exec = len(covered_lines) + len(missed_lines_set)
-        line_pct = (len(covered_lines) / max(total_exec, 1)) * 100
-        total_branch = branch_covered + branch_missed
-        branch_pct = (branch_covered / max(total_branch, 1)) * 100
-
+        trace_collection = self.trace_collector.collect_many(
+            target_method,
+            test_class_sig,
+            scenario_methods or {},
+        )
+        goal = None
+        if trace_collection.status == "ok":
+            goal = self._build_next_goal(
+                target_method,
+                coverage,
+                trace_collection.traces,
+                seed_scenario_id,
+            )
         return {
-            "line_coverage_pct": round(line_pct, 2),
-            "branch_coverage_pct": round(branch_pct, 2),
-            "missed_lines": sorted(missed_lines_set),
-            "best_path": best_path_info,
+            "status": "ok",
+            "line_coverage_pct": self._percentage(line_counter["covered"], line_total),
+            "branch_coverage_pct": self._percentage(branch_counter["covered"], branch_total),
+            "covered_lines": sorted(covered_lines),
+            "missed_lines": sorted(missed_lines),
+            "coverage_goal": goal,
+            "branch_trace_status": trace_collection.status,
+            "branch_trace_diagnostic": trace_collection.diagnostic,
         }
 
-    # ── JaCoCo ───────────────────────────────────────────────────────
+    def collect_metrics_only(self, target_method, test_class_sig: str) -> dict:
+        coverage = self._collect_jacoco(target_method, test_class_sig)
+        if coverage.get("status") != "ok":
+            return coverage
+        line_counter = coverage["counters"].get("LINE", {"covered": 0, "missed": 0})
+        branch_counter = coverage["counters"].get("BRANCH", {"covered": 0, "missed": 0})
+        line_total = line_counter["covered"] + line_counter["missed"]
+        branch_total = branch_counter["covered"] + branch_counter["missed"]
+        return {
+            "status": "ok",
+            "line_coverage_pct": self._percentage(line_counter["covered"], line_total),
+            "branch_coverage_pct": self._percentage(branch_counter["covered"], branch_total),
+        }
 
-    def _run_jacoco(self, test_class_sig: str, target_method) -> tuple[int, int, int, int]:
-        """Run Maven + JaCoCo. Returns (line_covered, line_missed, branch_covered, branch_missed)."""
-        pom = os.path.join(self.project_loc, "pom.xml")
-        if not os.path.exists(pom):
-            total_lines = len(target_method.line_range)
-            return 0, total_lines, 0, 0
+    @staticmethod
+    def _percentage(covered: int, total: int) -> float:
+        return 100.0 if total == 0 else round(100.0 * covered / total, 2)
 
-        cmd = [
-            "mvn", "test", "-q",
-            f"-Dtest={test_class_sig}",
-            "-Djacoco.outputDir=target/jacoco-report"
-        ]
-        try:
-            subprocess.run(
-                cmd, cwd=self.project_loc,
-                capture_output=True, text=True, timeout=180
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            total_lines = len(target_method.line_range)
-            return 0, total_lines, 0, 0
-
-        report_file = os.path.join(self.project_loc, "target", "jacoco-report", "jacoco.xml")
-        if not os.path.exists(report_file):
-            total_lines = len(target_method.line_range)
-            return 0, total_lines, 0, 0
-
-        return self._parse_jacoco_for_method(report_file, target_method)
-
-    def _parse_jacoco_for_method(self, jacoco_xml: str, target_method) -> tuple[int, int, int, int]:
-        """Parse JaCoCo XML LINE and BRANCH counters for the target method's class.
-        Returns (line_covered, line_missed, branch_covered, branch_missed).
-        """
-        try:
-            tree = ET.parse(jacoco_xml)
-            root = tree.getroot()
-
-            target_class_short = target_method.belong_class.name_no_package
-            target_pkg = target_method.belong_package.name.replace(".", "/")
-
-            line_covered = 0
-            line_missed = 0
-            branch_covered = 0
-            branch_missed = 0
-
-            for pkg in root.findall("package"):
-                pkg_name = pkg.get("name", "")
-                if target_pkg and pkg_name != target_pkg:
-                    continue
-                for cls in pkg.findall("class"):
-                    cls_name = cls.get("name", "")
-                    if cls_name != target_class_short:
-                        continue
-                    for counter in cls.findall("counter"):
-                        ctype = counter.get("type")
-                        if ctype == "LINE":
-                            line_covered = int(counter.get("covered", 0))
-                            line_missed = int(counter.get("missed", 0))
-                        elif ctype == "BRANCH":
-                            branch_covered = int(counter.get("covered", 0))
-                            branch_missed = int(counter.get("missed", 0))
-
-            return line_covered, line_missed, branch_covered, branch_missed
-        except Exception as e:
-            logger.debug(f"Failed to parse JaCoCo XML: {e}")
-            total_lines = len(target_method.line_range)
-            return 0, total_lines, 0, 0
-
-    # ── Map JaCoCo counts to specific lines via CFG mapping ──────────
-
-    def _map_coverage_to_lines(self, target_method, covered_count: int,
-                                missed_count: int) -> tuple[set, set]:
-        """Use belong_file's node_id_to_line_number to map JaCoCo coverage counts
-        to specific line numbers.
-
-        node_id_to_line_number: {node_id: [line_number, ...]}
-        """
-        belong_file = target_method.belong_file
-        if belong_file is None or belong_file.node_id_to_line_number is None:
-            return set(), target_method.line_range
-
-        node_id_to_lines = belong_file.node_id_to_line_number
-
-        # collect all line numbers that are part of the method's CFG
-        cfg_lines = set()
-        for node_id, line_numbers in node_id_to_lines.items():
-            for ln in line_numbers:
-                if ln in target_method.line_range:
-                    cfg_lines.add(ln)
-
-        if not cfg_lines:
-            return set(), target_method.line_range
-
-        # executable lines within CFG
-        executable_lines = self._filter_executable_lines(target_method, cfg_lines)
-        executable_sorted = sorted(executable_lines)
-
-        # Map: first `covered_count` executable lines are covered, rest are missed.
-        covered_lines = set(executable_sorted[:covered_count])
-        missed_lines_set = executable_lines - covered_lines
-
-        return covered_lines, missed_lines_set
-
-    def _filter_executable_lines(self, target_method, cfg_lines: set) -> set:
-        """Filter to only executable lines (non-blank, non-comment, non-brace)."""
-        belong_file = target_method.belong_file
-        src_file = None
-        if belong_file is not None:
-            src_file = belong_file.file_path
-
-        if src_file is None:
-            src_file = os.path.join(self.project_loc, self.src_loc,
-                                    target_method.belong_class.name.replace(".", os.sep) + ".java")
-
-        if not os.path.exists(src_file):
-            return cfg_lines
-
-        with open(src_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        executable = set()
-        for line_num in cfg_lines:
-            idx = line_num - 1
-            if idx < 0 or idx >= len(lines):
-                continue
-            stripped = lines[idx].strip()
-            if (stripped and
-                not stripped.startswith("//") and
-                not stripped.startswith("/*") and
-                not stripped.startswith("*") and
-                stripped not in ("{", "}")):
-                executable.add(line_num)
-
-        return executable
-
-    # ── Best path from cfg_info (line coverage only) ─────────────────
-
-    def _find_best_path(self, target_method, missed_lines_set: set) -> dict | None:
-        """Search all paths in cfg_info to find the one that covers the most missed lines.
-
-        Uses belong_file's node_id_to_line_number for precise node-to-line mapping.
-        Only considers line coverage (not branch coverage) when evaluating paths.
-
-        Each path structure:
-            {
-                "path": [
-                    {"id": node_id, "statement": "...", "conditional": None},
-                    {"id": node_id, "statement": "...", "conditional": "pos_next"},
-                    {"id": node_id, "statement": "...", "conditional": "neg_next"},
-                ],
-                "true_branches": [...],
-                "method_calls_within_class": [...],
-                "method_calls_outside_class": [...],
-            }
-        """
-        if target_method.cfg_info is None:
-            return None
-
-        belong_file = target_method.belong_file
-        if belong_file is None:
-            return None
-
-        node_id_to_lines = belong_file.node_id_to_line_number
-        if node_id_to_lines is None:
-            return None
-
-        cfg = target_method.cfg_info
+    def _build_next_goal(self, target_method, coverage: dict, traces: dict,
+                         seed_scenario_id: Optional[str]) -> Optional[dict]:
+        cfg = target_method.cfg_info or {}
         paths = cfg.get("paths", [])
-        if not paths:
-            return None
-
-        best_path_entry = None
-        best_missed_count = 0
-        best_branch_conditions = []
-        best_path_nodes = []
+        node_to_lines = getattr(target_method.belong_file, "node_id_to_line_number", None) or {}
+        candidates = []
 
         for path_entry in paths:
             path_nodes = path_entry.get("path", [])
-            path_missed_lines = set()
-            branch_conditions = []
+            covered_prefix = 0
+            prefix_open = True
+            for index, node in enumerate(path_nodes):
+                node_lines = node_to_lines.get(node.get("id"), [])
+                line_counts = [coverage["lines"].get(line) for line in node_lines]
+                node_covered = any(item and item["covered_instructions"] > 0 for item in line_counts)
+                if prefix_open and node_covered:
+                    covered_prefix += 1
+                else:
+                    prefix_open = False
 
-            for node in path_nodes:
-                node_id = node.get("id")
-                stmt = node.get("statement", "")
-                conditional = node.get("conditional")
+                if node.get("conditional") is None:
+                    continue
+                branch_lines = [
+                    line for line in node_lines
+                    if coverage["lines"].get(line, {}).get("missed_branches", 0) > 0
+                ]
+                if not branch_lines:
+                    continue
+                target_outcome = bool(node["conditional"])
+                key = (node.get("id"), target_outcome)
+                if key in self.attempted_targets:
+                    continue
+                observed_for_target = {
+                    step.outcome
+                    for trace in traces.values()
+                    for step in trace
+                    if step.node_id == node.get("id")
+                }
+                if target_outcome in observed_for_target:
+                    continue
+                reached_frontier = bool(observed_for_target)
+                best_seed = seed_scenario_id
+                best_trace_prefix = 0
+                for scenario_id, trace in traces.items():
+                    prefix = self._trace_prefix_length(path_nodes, index, trace)
+                    if prefix > best_trace_prefix:
+                        best_trace_prefix = prefix
+                        best_seed = scenario_id
+                    if any(step.node_id == node.get("id") for step in trace):
+                        best_seed = scenario_id
+                        best_trace_prefix = index
+                        break
+                # A reached branch is an actionable frontier: prefer its earliest
+                # uncovered exit. For an unreached region, first maximize the real
+                # dynamic prefix and then choose the first CFG edge beyond it.
+                frontier_order = index if reached_frontier else -best_trace_prefix
+                candidates.append((
+                    0 if reached_frontier else 1,
+                    frontier_order,
+                    index,
+                    -covered_prefix,
+                    str(node.get("id")),
+                    path_nodes,
+                    index,
+                    target_outcome,
+                    tuple(branch_lines),
+                    key,
+                    best_seed,
+                ))
 
-                # map node_id to line numbers
-                line_numbers = node_id_to_lines.get(node_id, [])
-                for ln in line_numbers:
-                    if ln in missed_lines_set:
-                        path_missed_lines.add(ln)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[:5])
+        _, _, _, _, _, path_nodes, target_index, target_outcome, target_lines, target_key, best_seed = candidates[0]
+        formula = self.symbolic_builder.build(
+            target_method,
+            path_nodes,
+            target_index,
+            target_outcome,
+            best_seed,
+        )
+        goal = self.sanitizer.sanitize(target_method, formula)
+        public_goal = goal.to_public_dict()
+        self.private_formulas[goal.goal_id] = formula
+        self.public_goals[goal.goal_id] = public_goal
+        self.witness_binder.register(
+            formula,
+            target_method.parameters_list,
+            receiver_type=target_method.belong_class.name,
+        )
 
-                # collect branch conditions (for scenario generation context)
-                if conditional is not None and stmt and stmt.strip():
-                    node_lines = node_id_to_lines.get(node_id, [])
-                    line_num = node_lines[0] if node_lines else 0
-                    branch_conditions.append({
-                        "line": line_num,
-                        "statement": stmt.strip(),
-                        "conditional": conditional,
-                    })
+        covered_branches = sum(coverage["lines"][line]["covered_branches"] for line in target_lines)
+        missed_branches = sum(coverage["lines"][line]["missed_branches"] for line in target_lines)
+        self.goal_baselines[goal.goal_id] = _GoalBaseline(
+            target_lines=target_lines,
+            covered_branches=covered_branches,
+            missed_branches=missed_branches,
+            target_key=target_key,
+        )
+        return public_goal
 
-            if len(path_missed_lines) > best_missed_count:
-                best_missed_count = len(path_missed_lines)
-                best_path_entry = path_entry
-                best_branch_conditions = branch_conditions
-                best_path_nodes = path_nodes
+    @staticmethod
+    def _trace_prefix_length(path_nodes: list[dict], target_index: int, trace: list) -> int:
+        decisions = [
+            (node.get("id"), bool(node.get("conditional")))
+            for node in path_nodes[:target_index]
+            if node.get("conditional") is not None
+        ]
+        if not decisions or not trace:
+            return 0
+        matched = 0
+        trace_index = 0
+        for node_id, outcome in decisions:
+            while trace_index < len(trace):
+                step = trace[trace_index]
+                trace_index += 1
+                if step.node_id == node_id and step.outcome == outcome:
+                    matched += 1
+                    break
+            else:
+                break
+        return matched
 
-        if best_path_entry is None:
+    def verify_goal(self, goal_id: str, test_class_sig: str, method_name: str, _test_code: str = "") -> tuple[bool, dict]:
+        if goal_id not in self.goal_baselines:
+            return False, {"status": "unknown_coverage_goal"}
+        formula = self.private_formulas[goal_id]
+        target_method = getattr(formula, "_target_method", None)
+        if target_method is None:
+            # The owning method is recovered from the last collection; callers use one analyzer per method.
+            target_method = getattr(self, "_target_method", None)
+        if target_method is None:
+            return False, {"status": "missing_target_method"}
+
+        trace_collection = self.trace_collector.collect_many(
+            target_method,
+            test_class_sig,
+            {goal_id: method_name},
+        )
+        if trace_collection.status != "ok":
+            return False, {
+                "status": "target_trace_unavailable",
+                "trace_status": trace_collection.status,
+                "diagnostic": trace_collection.diagnostic,
+            }
+        target_trace = trace_collection.traces.get(goal_id, [])
+        exact_edge_hit = any(
+            step.node_id == formula.target_node_id and step.outcome == formula.target_outcome
+            for step in target_trace
+        )
+
+        # Re-run the generated class so the branch counters remain comparable with the
+        # baseline union. Maven is told to ignore assertion failures for coverage only.
+        coverage = self._collect_jacoco(target_method, test_class_sig, None)
+        if coverage["status"] != "ok":
+            return False, {"status": coverage["status"], "diagnostic": coverage.get("diagnostic", "")}
+
+        baseline = self.goal_baselines[goal_id]
+        after_covered = sum(
+            coverage["lines"].get(line, {}).get("covered_branches", 0)
+            for line in baseline.target_lines
+        )
+        after_missed = sum(
+            coverage["lines"].get(line, {}).get("missed_branches", 0)
+            for line in baseline.target_lines
+        )
+        coverage_progress = (
+            after_covered > baseline.covered_branches
+            or after_missed < baseline.missed_branches
+        )
+        target_hit = exact_edge_hit and coverage_progress
+        self.witness_binder.mark_verified(goal_id, target_hit)
+        self.attempted_targets.add(baseline.target_key)
+        return target_hit, {
+            "status": "target_hit" if target_hit else "target_miss",
+            "exact_edge_hit": exact_edge_hit,
+            "covered_branch_delta": after_covered - baseline.covered_branches,
+            "missed_branch_delta": after_missed - baseline.missed_branches,
+        }
+
+    def abandon_goal(self, goal_id: str, reason: str) -> None:
+        baseline = self.goal_baselines.get(goal_id)
+        if baseline is not None:
+            self.attempted_targets.add(baseline.target_key)
+        try:
+            record = self.witness_binder.vault.get(goal_id)
+            record.failure_reason = reason
+        except KeyError:
+            pass
+
+    def _collect_jacoco(
+        self,
+        target_method,
+        test_class_sig: str,
+        method_name: Optional[str] = None,
+    ) -> dict:
+        self._target_method = target_method
+        report = self._run_jacoco(test_class_sig, method_name)
+        if report is None:
+            return {
+                "status": "coverage_unavailable",
+                "diagnostic": self._jacoco_diagnostic or "JaCoCo report was not produced",
+            }
+        return self._parse_jacoco_for_method(report, target_method)
+
+    def _run_jacoco(self, test_class_sig: str, method_name: Optional[str]) -> Optional[str]:
+        self._jacoco_diagnostic = ""
+        started_at = time.time()
+        pom = os.path.join(self.project_loc, "pom.xml")
+        selector = test_class_sig if not method_name else f"{test_class_sig}#{method_name}"
+        if os.path.isfile(pom):
+            command = [
+                "mvn",
+                "-q",
+                f"-Dtest={selector}",
+                "-Dmaven.test.failure.ignore=true",
+                "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
+                "test",
+                "org.jacoco:jacoco-maven-plugin:0.8.12:report",
+            ]
+            try:
+                subprocess.run(
+                    command,
+                    cwd=self.project_loc,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(CONFIG["pipeline"]["coverage_timeout_seconds"]),
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                self._jacoco_diagnostic = str(exc)
+                logger.warning(f"JaCoCo collection failed: {exc}")
+        else:
+            return self._run_defects4j_jacoco(test_class_sig, method_name)
+
+        candidates = [
+            os.path.join(self.project_loc, "target", "site", "jacoco", "jacoco.xml"),
+            os.path.join(self.project_loc, "target", "jacoco-report", "jacoco.xml"),
+        ]
+        candidates.extend(glob.glob(os.path.join(self.project_loc, "**", "jacoco.xml"), recursive=True))
+        existing = [
+            path for path in candidates
+            if os.path.isfile(path) and os.path.getmtime(path) + 1 >= started_at
+        ]
+        return max(existing, key=os.path.getmtime) if existing else None
+
+    def _run_defects4j_jacoco(
+        self,
+        test_class_sig: str,
+        method_name: Optional[str],
+    ) -> Optional[str]:
+        agent_jar = CONFIG.get("coverage", {}).get("jacoco_agent_jar", "")
+        cli_jar = CONFIG.get("coverage", {}).get("jacoco_cli_jar", "")
+        if not agent_jar or not cli_jar:
+            self._jacoco_diagnostic = (
+                "Defects4J JaCoCo requires DP_CFG_JACOCO_AGENT_JAR and "
+                "DP_CFG_JACOCO_CLI_JAR"
+            )
+            return None
+        if not os.path.isfile(agent_jar) or not os.path.isfile(cli_jar):
+            self._jacoco_diagnostic = "Configured JaCoCo agent or CLI jar does not exist"
             return None
 
-        return {
-            "path_nodes": best_path_nodes,
-            "branch_conditions": best_branch_conditions,
-            "true_branches": best_path_entry.get("true_branches", []),
-            "method_calls_within_class": best_path_entry.get("method_calls_within_class", []),
-            "method_calls_outside_class": best_path_entry.get("method_calls_outside_class", []),
+        timeout = int(CONFIG["pipeline"]["coverage_timeout_seconds"])
+
+        def run(command, env=None):
+            return subprocess.run(
+                command,
+                cwd=self.project_loc,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+
+        try:
+            compile_result = run(["defects4j", "compile"])
+            if compile_result.returncode != 0:
+                self._jacoco_diagnostic = compile_result.stdout + compile_result.stderr
+                return None
+
+            exported = {}
+            for property_name in ("dir.bin.classes", "dir.src.classes"):
+                result = run(["defects4j", "export", "-p", property_name])
+                if result.returncode != 0 or not result.stdout.strip():
+                    self._jacoco_diagnostic = f"Could not export Defects4J property {property_name}"
+                    return None
+                exported[property_name] = result.stdout.strip().splitlines()[-1]
+
+            output_dir = os.path.join(self.project_loc, "target", "dp-cfg")
+            os.makedirs(output_dir, exist_ok=True)
+            execution_data = os.path.join(output_dir, "jacoco.exec")
+            report = os.path.join(output_dir, "jacoco.xml")
+            for stale in (execution_data, report):
+                if os.path.isfile(stale):
+                    os.remove(stale)
+
+            selector = test_class_sig if not method_name else f"{test_class_sig}::{method_name}"
+            test_environment = os.environ.copy()
+            agent_option = f"-javaagent:{agent_jar}=destfile={execution_data},append=false"
+            existing_options = test_environment.get("JAVA_TOOL_OPTIONS", "").strip()
+            test_environment["JAVA_TOOL_OPTIONS"] = " ".join(
+                item for item in (existing_options, agent_option) if item
+            )
+            # A bug-revealing assertion is allowed to return non-zero. The execution
+            # data, not the build status, determines whether coverage is available.
+            run(["defects4j", "test", "-t", selector], env=test_environment)
+            if not os.path.isfile(execution_data):
+                self._jacoco_diagnostic = "Defects4J test produced no JaCoCo execution data"
+                return None
+
+            classes = os.path.join(self.project_loc, exported["dir.bin.classes"])
+            sources = os.path.join(self.project_loc, exported["dir.src.classes"])
+            report_result = run([
+                "java", "-jar", cli_jar, "report", execution_data,
+                "--classfiles", classes,
+                "--sourcefiles", sources,
+                "--xml", report,
+            ])
+            if report_result.returncode != 0 or not os.path.isfile(report):
+                self._jacoco_diagnostic = report_result.stdout + report_result.stderr
+                return None
+            return report
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            self._jacoco_diagnostic = str(exc)
+            return None
+
+    def _parse_jacoco_for_method(self, jacoco_xml: str, target_method) -> dict:
+        try:
+            root = ET.parse(jacoco_xml).getroot()
+        except (ET.ParseError, OSError) as exc:
+            return {"status": "coverage_parse_error", "diagnostic": str(exc)}
+
+        package_name = target_method.belong_package.name.replace(".", "/")
+        class_name = target_method.belong_class.name.replace(".", "/")
+        target_package = next((item for item in root.findall("package") if item.get("name") == package_name), None)
+        if target_package is None:
+            return {"status": "target_package_not_found", "diagnostic": package_name}
+        target_class = next((item for item in target_package.findall("class") if item.get("name") == class_name), None)
+        if target_class is None:
+            return {"status": "target_class_not_found", "diagnostic": class_name}
+
+        start_line = min(target_method.line_range) if target_method.line_range else None
+        methods = [item for item in target_class.findall("method") if item.get("name") == target_method.name_no_package]
+        descriptor = self._method_descriptor(target_method)
+        descriptor_matches = [item for item in methods if item.get("desc") == descriptor]
+        if descriptor_matches:
+            methods = descriptor_matches
+        if start_line is not None:
+            exact = [item for item in methods if int(item.get("line", -1)) == start_line]
+            if exact:
+                methods = exact
+            elif methods:
+                methods.sort(key=lambda item: abs(int(item.get("line", start_line)) - start_line))
+                methods = methods[:1]
+        if len(methods) != 1:
+            return {
+                "status": "target_method_not_found" if not methods else "target_method_ambiguous",
+                "diagnostic": target_method.signature,
+            }
+        method_element = methods[0]
+
+        counters = {}
+        for counter in method_element.findall("counter"):
+            counters[counter.get("type", "")] = {
+                "covered": int(counter.get("covered", 0)),
+                "missed": int(counter.get("missed", 0)),
+            }
+
+        source_name = target_class.get("sourcefilename")
+        source_file = next(
+            (item for item in target_package.findall("sourcefile") if item.get("name") == source_name),
+            None,
+        )
+        lines = {}
+        if source_file is not None:
+            for line in source_file.findall("line"):
+                number = int(line.get("nr", 0))
+                if target_method.line_range and number not in target_method.line_range:
+                    continue
+                lines[number] = {
+                    "missed_instructions": int(line.get("mi", 0)),
+                    "covered_instructions": int(line.get("ci", 0)),
+                    "missed_branches": int(line.get("mb", 0)),
+                    "covered_branches": int(line.get("cb", 0)),
+                }
+        return {"status": "ok", "counters": counters, "lines": lines}
+
+    @staticmethod
+    def _method_descriptor(target_method) -> str:
+        parameters = "".join(
+            CoverageAnalyzer._type_descriptor(item, target_method)
+            for item in target_method.parameters_list
+        )
+        return f"({parameters}){CoverageAnalyzer._type_descriptor(target_method.return_type, target_method)}"
+
+    @staticmethod
+    def _type_descriptor(type_name: str, target_method) -> str:
+        type_name = type_name.strip().replace("...", "[]")
+        type_name = type_name.split("<", 1)[0].strip()
+        dimensions = 0
+        while type_name.endswith("[]"):
+            dimensions += 1
+            type_name = type_name[:-2]
+        primitives = {
+            "void": "V", "boolean": "Z", "byte": "B", "char": "C", "short": "S",
+            "int": "I", "long": "J", "float": "F", "double": "D",
         }
+        if type_name in primitives:
+            descriptor = primitives[type_name]
+        else:
+            java_lang = {
+                "String", "Boolean", "Byte", "Character", "Short", "Integer", "Long", "Float", "Double",
+            }
+            if "." not in type_name:
+                type_name = target_method.import_map.get(type_name, type_name)
+                if "." not in type_name and type_name in java_lang:
+                    type_name = "java.lang." + type_name
+                elif "." not in type_name:
+                    type_name = target_method.belong_package.name + "." + type_name
+            descriptor = "L" + type_name.replace(".", "/") + ";"
+        return "[" * dimensions + descriptor

@@ -890,38 +890,15 @@ def find_method_java_doc(single_file):
     find_all_javadocs(root_node , javadoc_list)
     
     for method in single_file.methods:
-        if single_file.file_name != 'NumberUtils.java' and method.name_no_package != 'createNumber':
-            continue
-
         method_start_line = method.node.start_point[0]
-        for javadoc in javadoc_list:
+        for javadoc in reversed(javadoc_list):
             javadoc_end_line = javadoc[0]
             if javadoc_end_line != method_start_line - 1:
                 continue
 
             javadoc_content = javadoc[1]
-            flag = True
-            for content_line in javadoc_content.split('\n'):
-                if content_line.strip().startswith('*') or content_line.strip().startswith('/**') or content_line.strip().startswith('*/'):
-                    continue
-
-                flag = False
-
-            params = []
-
-            if javadoc_content.startswith('/**') and flag:
+            if javadoc_content.startswith('/**'):
                 cleaned_javadoc = clean_javadoc_ts(javadoc_content)
-                for content_line in cleaned_javadoc.split('\n'):
-                    if content_line.strip().startswith('@param'):
-                        param = content_line.strip().split(' ')[1].strip(' ,')
-                        params.append(param)
-                
-                if len(params) != len(method.parameters_list):
-                    continue
-
-                if len(params) != 0 and any(param not in method.parameters_string for param in params):
-                    continue
-                    
                 method.add_javadoc(cleaned_javadoc)
                 break
 
